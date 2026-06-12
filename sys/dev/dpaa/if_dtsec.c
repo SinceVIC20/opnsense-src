@@ -749,6 +749,7 @@ dtsec_sfp_module_remove(void *arg)
 	sc->sc_sfp_modpresent = false;
 	sc->sc_sfp_phy_link = false;
 	sc->sc_sfp_phy_speed = 0;
+	sc->sc_sfp_phy_modes = 0;
 	dtsec_sfp_set_media(sc);
 	if_link_state_change(sc->sc_ifnet, LINK_STATE_UNKNOWN);
 }
@@ -778,11 +779,20 @@ dtsec_sfp_link_down(void *arg)
 	if_link_state_change(sc->sc_ifnet, LINK_STATE_DOWN);
 }
 
+static void
+dtsec_sfp_phy_modes(void *arg, uint32_t modes)
+{
+	struct dtsec_softc *sc = arg;
+
+	sc->sc_sfp_phy_modes = modes;
+}
+
 const struct sfp_upstream_ops dtsec_sfp_ops = {
 	.module_insert	= dtsec_sfp_module_insert,
 	.module_remove	= dtsec_sfp_module_remove,
 	.link_up	= dtsec_sfp_link_up,
 	.link_down	= dtsec_sfp_link_down,
+	.phy_modes	= dtsec_sfp_phy_modes,
 };
 /** @} */
 
@@ -1120,6 +1130,35 @@ dtsec_sysctl_sfp_info(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
 }
 
+static int
+dtsec_sysctl_sfp_phy_modes(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	uint32_t m = sc->sc_sfp_phy_modes;
+	char buf[64];
+	size_t len;
+
+	/* Ascending rate order; empty for fiber/DAC or no PHY. */
+	buf[0] = '\0';
+	if (sc->sc_sfp_modpresent && m != 0) {
+		if (m & SFP_MODE_100_T)
+			strlcat(buf, "100M, ", sizeof(buf));
+		if (m & SFP_MODE_1000_T)
+			strlcat(buf, "1G, ", sizeof(buf));
+		if (m & SFP_MODE_2500_T)
+			strlcat(buf, "2.5G, ", sizeof(buf));
+		if (m & SFP_MODE_5000_T)
+			strlcat(buf, "5G, ", sizeof(buf));
+		if (m & SFP_MODE_10G_T)
+			strlcat(buf, "10G, ", sizeof(buf));
+		len = strlen(buf);
+		if (len >= 2)			/* trim trailing ", " */
+			buf[len - 2] = '\0';
+	}
+
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
 static uint64_t
 dtsec_get_counter(if_t ifp, ift_counter cnt)
 {
@@ -1342,6 +1381,11 @@ dtsec_attach(device_t dev)
 			    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
 			    sc, 0, dtsec_sysctl_sfp_eeprom, "A",
 			    "SFP module EEPROM A0h+A2h (hex, 512 bytes)");
+			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+			    OID_AUTO, "sfp_phy_modes",
+			    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+			    sc, 0, dtsec_sysctl_sfp_phy_modes, "A",
+			    "SFP copper PHY supported rates (e.g. \"1G, 2.5G, 5G, 10G\")");
 		}
 	}
 

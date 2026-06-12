@@ -151,6 +151,7 @@ struct dtsec_softc {
 	bool				sc_sfp_modpresent; /* module present */
 	bool				sc_sfp_phy_link; /* link state */
 	int				sc_sfp_phy_speed; /* speed in Mbps */
+	uint32_t			sc_sfp_phy_modes; /* SFP_MODE_* bitmask */
 
 	/* Standalone ifmedia for SFP+ ports (no mii); module-derived list. */
 	struct ifmedia			sc_ifmedia;
