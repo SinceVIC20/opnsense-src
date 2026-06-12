@@ -31,6 +31,8 @@
 
 #include <sys/taskqueue.h>
 
+#include <net/if_media.h>
+
 /**
  * @group dTSEC common API.
  * @{
@@ -149,6 +151,10 @@ struct dtsec_softc {
 	bool				sc_sfp_modpresent; /* module present */
 	bool				sc_sfp_phy_link; /* link state */
 	int				sc_sfp_phy_speed; /* speed in Mbps */
+
+	/* Standalone ifmedia for SFP+ ports (no mii); module-derived list. */
+	struct ifmedia			sc_ifmedia;
+	bool				sc_ifmedia_ready;
 };
 /** @} */
 

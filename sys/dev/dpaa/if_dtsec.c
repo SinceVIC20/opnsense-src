@@ -527,6 +527,9 @@ dtsec_if_ioctl(if_t ifp, u_long command, caddr_t data)
 		if (sc->sc_mii != NULL)
 			error = ifmedia_ioctl(ifp, ifr,
 			    &sc->sc_mii->mii_media, command);
+		else if (sc->sc_sfp_dev != NULL)
+			error = ifmedia_ioctl(ifp, ifr, &sc->sc_ifmedia,
+			    command);
 		else
 			error = ENOTTY;
 		break;
@@ -691,6 +694,40 @@ dtsec_sfp_trim(char *dst, const uint8_t *src, int len)
 		dst[i] = '\0';
 }
 
+static void
+dtsec_sfp_set_media(struct dtsec_softc *sc)
+{
+	uint8_t conn;
+
+	if (sc->sc_sfp_dev == NULL || !sc->sc_ifmedia_ready)
+		return;
+
+	ifmedia_removeall(&sc->sc_ifmedia);
+
+	if (!sc->sc_sfp_modpresent) {
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_AUTO, 0, NULL);
+		ifmedia_set(&sc->sc_ifmedia, IFM_ETHER | IFM_AUTO);
+		return;
+	}
+
+	conn = sc->sc_sfp_id[SFP_CONNECTOR_OFFSET];
+	if (conn == SFP_CONNECTOR_RJ45) {
+		/* Copper PHY (10GBASE-T) module. */
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_10G_T, 0, NULL);
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_5000_T, 0, NULL);
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_2500_T, 0, NULL);
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_1000_T, 0, NULL);
+	} else if (conn == SFP_CONNECTOR_LC) {
+		/* Optical module. */
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_10G_SR, 0, NULL);
+	} else {
+		/* Passive/active direct-attach copper (DAC) and others. */
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_10G_TWINAX, 0, NULL);
+	}
+	ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_AUTO, 0, NULL);
+	ifmedia_set(&sc->sc_ifmedia, IFM_ETHER | IFM_AUTO);
+}
+
 static int
 dtsec_sfp_module_insert(void *arg, const uint8_t *id, int id_len)
 {
@@ -698,6 +735,7 @@ dtsec_sfp_module_insert(void *arg, const uint8_t *id, int id_len)
 
 	memcpy(sc->sc_sfp_id, id, MIN((int)sizeof(sc->sc_sfp_id), id_len));
 	sc->sc_sfp_modpresent = true;
+	dtsec_sfp_set_media(sc);
 
 	return (0);	/* accept all modules */
 }
@@ -711,6 +749,7 @@ dtsec_sfp_module_remove(void *arg)
 	sc->sc_sfp_modpresent = false;
 	sc->sc_sfp_phy_link = false;
 	sc->sc_sfp_phy_speed = 0;
+	dtsec_sfp_set_media(sc);
 	if_link_state_change(sc->sc_ifnet, LINK_STATE_UNKNOWN);
 }
 
@@ -998,6 +1037,68 @@ dtsec_sysctl_diag(SYSCTL_HANDLER_ARGS)
 }
 
 static int
+dtsec_sfp_read_page(struct dtsec_softc *sc, uint8_t addr, uint8_t *buf, int len)
+{
+	struct iic_msg msgs[2];
+	uint8_t off;
+	int chunk, done, err;
+
+	/* Sequential reads in small chunks to respect controller limits. */
+	for (done = 0; done < len; done += chunk) {
+		chunk = MIN(32, len - done);
+		off = (uint8_t)done;
+		msgs[0].slave = addr << 1;
+		msgs[0].flags = IIC_M_WR;
+		msgs[0].len = 1;
+		msgs[0].buf = &off;
+		msgs[1].slave = addr << 1;
+		msgs[1].flags = IIC_M_RD;
+		msgs[1].len = chunk;
+		msgs[1].buf = buf + done;
+		err = iicbus_transfer(sc->sc_sfp_i2c, msgs, 2);
+		if (err != 0)
+			return (err);
+	}
+	return (0);
+}
+
+static int
+dtsec_sysctl_sfp_eeprom(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	static const char hexd[] = "0123456789abcdef";
+	uint8_t a0[256], a2[256];
+	char hex[2 * 512 + 1];
+	int i, err;
+
+	if (sc->sc_sfp_i2c == NULL || !sc->sc_sfp_modpresent)
+		return (sysctl_handle_string(oidp, "", 0, req));
+
+	memset(a0, 0, sizeof(a0));
+	memset(a2, 0, sizeof(a2));
+
+	err = iicbus_request_bus(sc->sc_sfp_i2c, sc->sc_dev, IIC_INTRWAIT);
+	if (err != 0)
+		return (sysctl_handle_string(oidp, "", 0, req));
+	err = dtsec_sfp_read_page(sc, 0x50, a0, sizeof(a0));
+	if (err == 0)
+		(void)dtsec_sfp_read_page(sc, 0x51, a2, sizeof(a2));
+	iicbus_release_bus(sc->sc_sfp_i2c, sc->sc_dev);
+	if (err != 0)
+		return (sysctl_handle_string(oidp, "", 0, req));
+
+	for (i = 0; i < 256; i++) {
+		hex[2 * i]     = hexd[a0[i] >> 4];
+		hex[2 * i + 1] = hexd[a0[i] & 0xf];
+		hex[512 + 2 * i]     = hexd[a2[i] >> 4];
+		hex[512 + 2 * i + 1] = hexd[a2[i] & 0xf];
+	}
+	hex[1024] = '\0';
+
+	return (sysctl_handle_string(oidp, hex, sizeof(hex), req));
+}
+
+static int
 dtsec_sysctl_sfp_info(SYSCTL_HANDLER_ARGS)
 {
 	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
@@ -1192,6 +1293,11 @@ dtsec_attach(device_t dev)
 			return (error);
 		}
 		sc->sc_mii = device_get_softc(sc->sc_mii_dev);
+	} else if (sc->sc_sfp_dev != NULL) {
+		ifmedia_init(&sc->sc_ifmedia, 0, dtsec_ifmedia_upd,
+		    dtsec_ifmedia_sts);
+		sc->sc_ifmedia_ready = true;
+		dtsec_sfp_set_media(sc);
 	}
 
 	/* Attach to stack */
@@ -1231,6 +1337,11 @@ dtsec_attach(device_t dev)
 			    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
 			    sc, 0, dtsec_sysctl_sfp_info, "A",
 			    "SFP+ module vendor and part number");
+			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
+			    OID_AUTO, "sfp_eeprom",
+			    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+			    sc, 0, dtsec_sysctl_sfp_eeprom, "A",
+			    "SFP module EEPROM A0h+A2h (hex, 512 bytes)");
 		}
 	}
 
@@ -1245,6 +1356,11 @@ dtsec_detach(device_t dev)
 
 	sc = device_get_softc(dev);
 	ifp = sc->sc_ifnet;
+
+	if (sc->sc_ifmedia_ready) {
+		ifmedia_removeall(&sc->sc_ifmedia);
+		sc->sc_ifmedia_ready = false;
+	}
 
 	if (device_is_attached(dev)) {
 		ether_ifdetach(ifp);
