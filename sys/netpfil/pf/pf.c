@@ -1491,6 +1491,27 @@ keyattach:
 				    si->src.state >= TCPS_FIN_WAIT_2 &&
 				    si->dst.state >= TCPS_FIN_WAIT_2)
 					reuse = true;
+				else if (sk->proto != IPPROTO_TCP &&
+				    sk->proto != IPPROTO_SCTP &&
+				    si->src.state == PFOTHERS_MULTIPLE &&
+				    si->dst.state == PFOTHERS_MULTIPLE)
+					/*
+					 * Old state already saw traffic in
+					 * both directions (e.g. an ICMP echo
+					 * request got its reply) -- same
+					 * reasoning as the TCP FIN_WAIT_2 case
+					 * above, just using the generic
+					 * non-TCP/SCTP state progression
+					 * instead of the TCP FSM. Without
+					 * this, a second ping to the same
+					 * destination with the same ICMP id
+					 * collides with the first ping's
+					 * still-live state and is dropped
+					 * (PFRES_STATEINS) until that state's
+					 * full PFTM_OTHER_MULTIPLE timeout
+					 * (60s) expires.
+					 */
+					reuse = true;
 
 				if (V_pf_status.debug >= PF_DEBUG_MISC) {
 					printf("pf: %s key attach "
