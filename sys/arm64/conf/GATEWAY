@@ -12,15 +12,17 @@ include		GENERIC
 
 ident		MONO-GATEWAY
 
-# Disable debug for production
-nooptions	INVARIANTS
-nooptions	INVARIANT_SUPPORT
-nooptions	WITNESS
-nooptions	WITNESS_SKIPSPIN
-nooptions	LOCK_PROFILING
+# Debug build: full visibility for investigating live issues,
+# performance is not a goal on this branch
+options 	INVARIANTS
+options 	INVARIANT_SUPPORT
+options 	WITNESS
+options 	WITNESS_SKIPSPIN
+options 	LOCK_PROFILING
 
 # OPNsense standard features (from SMP-ARM)
 options 	DDB
+options 	KDTRACE_HOOKS
 options 	GEOM_ELI
 options 	GEOM_MIRROR
 options 	IPFIREWALL_DEFAULT_TO_ACCEPT
