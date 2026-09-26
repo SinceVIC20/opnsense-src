@@ -867,8 +867,12 @@ dtsec_ifmedia_sts(if_t ifp, struct ifmediareq *ifmr)
 			if (ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) ==
 			    e_ENET_SPEED_1000)
 				ifmr->ifm_active |= IFM_1000_SX;
-			else
+			else if (sc->sc_sfp_id[SFP_CONNECTOR_OFFSET] ==
+			    SFP_CONNECTOR_LC)
 				ifmr->ifm_active |= IFM_10G_SR;
+			else
+				/* DAC and other non-optical modules */
+				ifmr->ifm_active |= IFM_10G_TWINAX;
 		}
 		if (sc->sc_sfp_phy_link)
 			ifmr->ifm_status = IFM_AVALID | IFM_ACTIVE;
