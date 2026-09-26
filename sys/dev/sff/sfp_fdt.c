@@ -79,6 +79,7 @@
 #define	MDIO_DEVID1		2
 #define	MDIO_DEVID2		3
 #define	MDIO_PMA_EXTABLE	11
+#define	MDIO_PMA_NG_EXTABLE	21
 #define	MDIO_AN_10GBT_CTRL	32
 #define	MDIO_AN_10GBT_STAT	33
 
@@ -97,6 +98,14 @@
 #define	MDIO_PMA_EXTABLE_10GBT		(1 << 2)
 #define	MDIO_PMA_EXTABLE_1000BT	(1 << 5)
 #define	MDIO_PMA_EXTABLE_NBT		(1 << 14)
+
+/* PMA NG_EXTABLE (2.5G/5G extended ability) bits */
+#define	MDIO_PMA_NG_EXTABLE_2_5GBT	(1 << 0)
+#define	MDIO_PMA_NG_EXTABLE_5GBT	(1 << 1)
+
+/* PMA CTRL1 speed select: bit 13 alone means 100M */
+#define	MDIO_PMA_CTRL1_SPEEDSEL		((1 << 13) | (1 << 6) | (0xf << 2))
+#define	MDIO_PMA_CTRL1_SPEED100		(1 << 13)
 
 /* AN 10GBT_CTRL advertisement bits */
 #define	MDIO_AN_10GBT_CTRL_ADV10G	(1 << 12)
@@ -622,27 +631,27 @@ sfp_phy_read_speed(struct sfp_fdt_softc *sc)
 	if (stat < 0 || !(stat & MDIO_AN_STAT1_COMPLETE))
 		return (0);
 
+	/* Highest rate both the partner and our PHY support (modes 0 = unknown) */
 	lpa10g = sfp_phy_read(sc, MDIO_MMD_AN, MDIO_AN_10GBT_STAT);
-	if (lpa10g >= 0) {
-		if (lpa10g & MDIO_AN_10GBT_STAT_LP10G)
-			return (10000);
-		if (lpa10g & MDIO_AN_10GBT_STAT_LP5G)
-			return (5000);
-		if (lpa10g & MDIO_AN_10GBT_STAT_LP2_5G)
-			return (2500);
-	}
+	if (lpa10g < 0)
+		return (0);
+	if ((lpa10g & MDIO_AN_10GBT_STAT_LP10G) &&
+	    (sc->sc_phy_modes == 0 || (sc->sc_phy_modes & SFP_MODE_10G_T)))
+		return (10000);
+	if ((lpa10g & MDIO_AN_10GBT_STAT_LP5G) &&
+	    (sc->sc_phy_modes == 0 || (sc->sc_phy_modes & SFP_MODE_5000_T)))
+		return (5000);
+	if ((lpa10g & MDIO_AN_10GBT_STAT_LP2_5G) &&
+	    (sc->sc_phy_modes == 0 || (sc->sc_phy_modes & SFP_MODE_2500_T)))
+		return (2500);
 
-	/* PMA/PMD CTRL1 speed select: bit 13=10G, bit 6=1G */
+	/* No shared multi-gig rate, so the link is 1G or 100M */
 	ctrl1 = sfp_phy_read(sc, MDIO_MMD_PMAPMD, MDIO_CTRL1);
-	if (ctrl1 >= 0) {
-		if (ctrl1 & (1 << 13))
-			return (10000);
-		if (ctrl1 & (1 << 6))
-			return (1000);
+	if (ctrl1 >= 0 &&
+	    (ctrl1 & MDIO_PMA_CTRL1_SPEEDSEL) == MDIO_PMA_CTRL1_SPEED100)
 		return (100);
-	}
 
-	return (0);
+	return (1000);
 }
 
 /*
@@ -846,9 +855,21 @@ sfp_fdt_sm_phy_probe(struct sfp_fdt_softc *sc)
 			modes |= SFP_MODE_10G_T;
 		if (extable & MDIO_PMA_EXTABLE_1000BT)
 			modes |= SFP_MODE_1000_T;
-		/* EXTABLE has one NBASE-T bit covering both 2.5G and 5G. */
-		if (extable & MDIO_PMA_EXTABLE_NBT)
-			modes |= SFP_MODE_2500_T | SFP_MODE_5000_T;
+		/* EXTABLE has one NBASE-T bit; register 1.21 splits 2.5G/5G. */
+		if (extable & MDIO_PMA_EXTABLE_NBT) {
+			int ngext = sfp_phy_read(sc, MDIO_MMD_PMAPMD,
+			    MDIO_PMA_NG_EXTABLE);
+
+			if (ngext >= 0 && (ngext &
+			    (MDIO_PMA_NG_EXTABLE_2_5GBT |
+			    MDIO_PMA_NG_EXTABLE_5GBT)) != 0) {
+				if (ngext & MDIO_PMA_NG_EXTABLE_2_5GBT)
+					modes |= SFP_MODE_2500_T;
+				if (ngext & MDIO_PMA_NG_EXTABLE_5GBT)
+					modes |= SFP_MODE_5000_T;
+			} else
+				modes |= SFP_MODE_2500_T | SFP_MODE_5000_T;
+		}
 		sc->sc_phy_modes = modes;
 
 		device_printf(sc->sc_dev,
@@ -914,6 +935,8 @@ sfp_fdt_sm_phy_poll(struct sfp_fdt_softc *sc)
 			sc->sc_phy_speed = speed;
 			device_printf(sc->sc_dev,
 			    "SFP+ PHY: negotiated %d Mbps\n", speed);
+			/* Tell the MAC driver the speed it didn't get at link up */
+			sfp_fdt_notify_link_up(sc, speed);
 		}
 	}
 }
@@ -984,6 +1007,8 @@ sfp_fdt_sm_link_up(struct sfp_fdt_softc *sc)
 				sc->sc_phy_speed = speed;
 				device_printf(sc->sc_dev,
 				    "SFP+ PHY: negotiated %d Mbps\n", speed);
+				/* Tell the MAC driver the speed it didn't get */
+				sfp_fdt_notify_link_up(sc, speed);
 			}
 		}
 	} else if (sc->sc_connector == SFP_CONNECTOR_RJ45) {

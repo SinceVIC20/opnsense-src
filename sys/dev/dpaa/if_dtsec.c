@@ -711,7 +711,12 @@ dtsec_sfp_set_media(struct dtsec_softc *sc)
 	}
 
 	conn = sc->sc_sfp_id[SFP_CONNECTOR_OFFSET];
-	if (conn == SFP_CONNECTOR_RJ45) {
+	if (ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) == e_ENET_SPEED_1000) {
+		/* 1000BASE-X port (1G firmware): every module runs at 1G. */
+		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER |
+		    (conn == SFP_CONNECTOR_RJ45 ? IFM_1000_T : IFM_1000_SX),
+		    0, NULL);
+	} else if (conn == SFP_CONNECTOR_RJ45) {
 		/* Copper PHY (10GBASE-T) module. */
 		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_10G_T, 0, NULL);
 		ifmedia_add(&sc->sc_ifmedia, IFM_ETHER | IFM_5000_T, 0, NULL);
@@ -751,6 +756,11 @@ dtsec_sfp_module_remove(void *arg)
 	sc->sc_sfp_phy_speed = 0;
 	sc->sc_sfp_phy_modes = 0;
 	dtsec_sfp_set_media(sc);
+	/* Back to the port's own rate until the next module reports one */
+	if (ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) == e_ENET_SPEED_10000)
+		if_setbaudrate(sc->sc_ifnet, IF_Gbps(10ULL));
+	else
+		if_setbaudrate(sc->sc_ifnet, IF_Gbps(1ULL));
 	if_link_state_change(sc->sc_ifnet, LINK_STATE_UNKNOWN);
 }
 
@@ -761,6 +771,10 @@ dtsec_sfp_link_up(void *arg, int speed)
 
 	sc->sc_sfp_phy_link = true;
 	sc->sc_sfp_phy_speed = speed;
+
+	/* Report the real line rate once the module knows it */
+	if (speed > 0)
+		if_setbaudrate(sc->sc_ifnet, IF_Mbps(speed));
 
 	if (sc->sc_mach != NULL &&
 	    ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) == e_ENET_SPEED_1000)
@@ -836,7 +850,15 @@ dtsec_ifmedia_sts(if_t ifp, struct ifmediareq *ifmr)
 			case 5000:  ifmr->ifm_active |= IFM_5000_T; break;
 			case 2500:  ifmr->ifm_active |= IFM_2500_T; break;
 			case 1000:  ifmr->ifm_active |= IFM_1000_T; break;
-			default:    ifmr->ifm_active |= IFM_10G_T; break;
+			case 100:   ifmr->ifm_active |= IFM_100_TX; break;
+			default:
+				/* Speed not known yet: show the port's own rate */
+				if (ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) ==
+				    e_ENET_SPEED_1000)
+					ifmr->ifm_active |= IFM_1000_T;
+				else
+					ifmr->ifm_active |= IFM_10G_T;
+				break;
 			}
 		} else {
 			/*
