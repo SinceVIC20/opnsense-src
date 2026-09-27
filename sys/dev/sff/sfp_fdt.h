@@ -78,6 +78,7 @@ struct sfp_upstream_ops {
 
 /* SFF-8024 connector types */
 #define	SFP_CONNECTOR_LC	0x07
+#define	SFP_CONNECTOR_COPPER_PIGTAIL	0x21	/* DAC cable */
 #define	SFP_CONNECTOR_RJ45	0x22
 
 /* SFF-8472 EEPROM A0h field offsets */
