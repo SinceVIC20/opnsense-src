@@ -317,7 +317,17 @@ sfp_fdt_log_module(struct sfp_fdt_softc *sc)
 	device_printf(sc->sc_dev,
 	    "SFP+ module: %s %s (connector 0x%02x%s)\n",
 	    vendor, partnum, connector,
-	    connector == SFP_CONNECTOR_RJ45 ? " RJ45" : "");
+	    connector == SFP_CONNECTOR_RJ45 ? " RJ45" :
+	    connector == SFP_CONNECTOR_COPPER_PIGTAIL ? " DAC" : "");
+}
+
+/* Name for link messages on LOS-based modules: DAC cable or fiber. */
+static const char *
+sfp_fdt_los_kind(struct sfp_fdt_softc *sc)
+{
+
+	return (sc->sc_connector == SFP_CONNECTOR_COPPER_PIGTAIL ?
+	    "DAC" : "fiber");
 }
 
 /*
@@ -975,7 +985,8 @@ sfp_fdt_sm_wait_los(struct sfp_fdt_softc *sc)
 		if (!los) {
 			/* LOS clear = signal present = link up */
 			sc->sc_los_prev = false;
-			device_printf(sc->sc_dev, "SFP+ fiber: link up\n");
+			device_printf(sc->sc_dev, "SFP+ %s: link up\n",
+			    sfp_fdt_los_kind(sc));
 			sfp_fdt_notify_link_up(sc, 0);
 			sc->sc_state = SFP_ST_LINK_UP;
 		}
@@ -1027,7 +1038,8 @@ sfp_fdt_sm_link_up(struct sfp_fdt_softc *sc)
 		gpio_pin_is_active(sc->sc_los, &los);
 		if (los && !sc->sc_los_prev) {
 			sc->sc_los_prev = true;
-			device_printf(sc->sc_dev, "SFP+ fiber: link down\n");
+			device_printf(sc->sc_dev, "SFP+ %s: link down\n",
+			    sfp_fdt_los_kind(sc));
 			sfp_fdt_notify_link_down(sc);
 			sc->sc_state = SFP_ST_WAIT_LOS;
 		} else if (!los && sc->sc_los_prev) {
