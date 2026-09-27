@@ -80,6 +80,8 @@
 
 #include <dev/sff/sfp_fdt.h>
 
+#include "memac_mdio.h"
+
 #define	DTSEC_MIN_FRAME_SIZE	64
 #define	DTSEC_MAX_FRAME_SIZE	9600
 
@@ -457,8 +459,9 @@ dtsec_if_enable_locked(struct dtsec_softc *sc)
 	 * are enabled via SIOCSIFFLAGS → dtsec_if_enable_locked()
 	 * without going through if_init(), so the tick never starts.
 	 * callout_reset is idempotent — safe to call if already running. */
-	if (sc->sc_mii != NULL)
-		callout_reset(&sc->sc_tick_callout, hz, dtsec_if_tick, sc);
+	if (sc->sc_mii != NULL || sc->sc_pcs_mdio != NULL)
+		callout_reset(&sc->sc_tick_callout, DTSEC_TICK(sc),
+		    dtsec_if_tick, sc);
 
 	/* Refresh link state */
 	dtsec_miibus_statchg(sc->sc_dev);
@@ -577,6 +580,8 @@ dtsec_if_ioctl(if_t ifp, u_long command, caddr_t data)
 	return (error);
 }
 
+static void dtsec_sfp_pcs_poll(struct dtsec_softc *sc);
+
 static void
 dtsec_if_tick(void *arg)
 {
@@ -588,8 +593,9 @@ dtsec_if_tick(void *arg)
 
 	if (sc->sc_mii != NULL)
 		mii_tick(sc->sc_mii);
+	dtsec_sfp_pcs_poll(sc);
 
-	callout_reset(&sc->sc_tick_callout, hz, dtsec_if_tick, sc);
+	callout_reset(&sc->sc_tick_callout, DTSEC_TICK(sc), dtsec_if_tick, sc);
 
 	DTSEC_UNLOCK(sc);
 }
@@ -621,7 +627,7 @@ dtsec_if_init_locked(struct dtsec_softc *sc)
 	}
 
 	/* Start MII polling / periodic diagnostics */
-	callout_reset(&sc->sc_tick_callout, hz, dtsec_if_tick, sc);
+	callout_reset(&sc->sc_tick_callout, DTSEC_TICK(sc), dtsec_if_tick, sc);
 
 	if (if_getflags(sc->sc_ifnet) & IFF_UP) {
 		error = dtsec_if_enable_locked(sc);
@@ -682,6 +688,54 @@ dtsec_if_watchdog(if_t ifp)
  * @group SFP upstream callbacks (from sfp_fdt state machine).
  * @{
  */
+
+/* PCS registers (Clause 45 MMD 3), as read by Linux for the Lynx PCS */
+#define	DTSEC_PCS_MMD		3
+#define	DTSEC_PCS_STAT1		1
+#define	DTSEC_PCS_STAT1_LINK	(1 << 2)
+
+/*
+ * On a 10G port with a fiber or DAC module, link comes from the PCS,
+ * not the module's LOS pin: a passive DAC has no LOS, so otherwise a
+ * far-end pull is never seen and link-up is reported blindly.
+ */
+static bool
+dtsec_sfp_pcs_managed(struct dtsec_softc *sc)
+{
+
+	return (sc->sc_pcs_mdio != NULL && sc->sc_sfp_modpresent &&
+	    ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) == e_ENET_SPEED_10000 &&
+	    sc->sc_sfp_id[SFP_CONNECTOR_OFFSET] != SFP_CONNECTOR_RJ45);
+}
+
+/* Called from the tick. */
+static void
+dtsec_sfp_pcs_poll(struct dtsec_softc *sc)
+{
+	int stat;
+	bool link;
+
+	if (!dtsec_sfp_pcs_managed(sc))
+		return;
+
+	/* Link status is latched low: the second read is the current state
+	 * (same as Mono's Linux sfp-led driver). */
+	stat = memac_mdio_read_c45(sc->sc_pcs_mdio, sc->sc_pcs_addr,
+	    DTSEC_PCS_MMD, DTSEC_PCS_STAT1);
+	if (stat >= 0 && stat != 0xffff)
+		stat = memac_mdio_read_c45(sc->sc_pcs_mdio, sc->sc_pcs_addr,
+		    DTSEC_PCS_MMD, DTSEC_PCS_STAT1);
+	if (stat < 0)
+		return;		/* try again next tick */
+	/* An unanswered read is all ones and must not count as link. */
+	link = stat != 0xffff && (stat & DTSEC_PCS_STAT1_LINK) != 0;
+
+	if (link == sc->sc_sfp_phy_link)
+		return;
+	sc->sc_sfp_phy_link = link;
+	if_link_state_change(sc->sc_ifnet,
+	    link ? LINK_STATE_UP : LINK_STATE_DOWN);
+}
 
 static void
 dtsec_sfp_trim(char *dst, const uint8_t *src, int len)
@@ -769,6 +823,10 @@ dtsec_sfp_link_up(void *arg, int speed)
 {
 	struct dtsec_softc *sc = arg;
 
+	/* The PCS decides link for these; LOS can be wrong. */
+	if (dtsec_sfp_pcs_managed(sc))
+		return;
+
 	sc->sc_sfp_phy_link = true;
 	sc->sc_sfp_phy_speed = speed;
 
@@ -787,6 +845,9 @@ static void
 dtsec_sfp_link_down(void *arg)
 {
 	struct dtsec_softc *sc = arg;
+
+	if (dtsec_sfp_pcs_managed(sc))
+		return;
 
 	sc->sc_sfp_phy_link = false;
 	sc->sc_sfp_phy_speed = 0;

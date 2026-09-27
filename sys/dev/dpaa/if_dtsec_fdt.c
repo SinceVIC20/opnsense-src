@@ -114,6 +114,51 @@ dtsec_fdt_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
+/*
+ * Find the 10G port's PCS on its internal MDIO bus, the same way Mono's
+ * Linux sfp-led driver does: the "xfi" entry of pcs-handle, falling back
+ * to the first pcs-handle or pcsphy-handle entry.
+ */
+static void
+dtsec_fdt_find_pcs(device_t dev, struct dtsec_softc *sc,
+    phandle_t enet_node)
+{
+	phandle_t *xrefs, pcs_node;
+	device_t mdio;
+	pcell_t addr;
+	ssize_t n;
+	int idx;
+
+	if (ofw_bus_find_string_index(enet_node, "pcs-handle-names", "xfi",
+	    &idx) != 0)
+		idx = 0;
+	n = OF_getencprop_alloc_multi(enet_node, "pcs-handle",
+	    sizeof(*xrefs), (void **)&xrefs);
+	if (n <= 0)
+		n = OF_getencprop_alloc_multi(enet_node, "pcsphy-handle",
+		    sizeof(*xrefs), (void **)&xrefs);
+	if (n <= 0)
+		return;
+	if (idx >= n) {
+		OF_prop_free(xrefs);
+		return;
+	}
+	pcs_node = OF_node_from_xref(xrefs[idx]);
+	OF_prop_free(xrefs);
+
+	if (!ofw_bus_node_status_okay(pcs_node) ||
+	    OF_getencprop(pcs_node, "reg", &addr, sizeof(addr)) <= 0)
+		return;
+	mdio = OF_device_from_xref(OF_xref_from_node(OF_parent(pcs_node)));
+	if (mdio == NULL || strcmp(device_get_name(mdio), "memac_mdio") != 0)
+		return;
+
+	sc->sc_pcs_mdio = mdio;
+	sc->sc_pcs_addr = addr;
+	device_printf(dev, "SFP link from PCS at %s addr %d\n",
+	    device_get_nameunit(mdio), sc->sc_pcs_addr);
+}
+
 static int
 dtsec_fdt_attach(device_t dev)
 {
@@ -201,6 +246,9 @@ skip_phy:
 
 				/* Keep I2C bus handle for sysctl diag */
 				SFF_GET_I2C_BUS(sfp_dev, &sc->sc_sfp_i2c);
+
+				/* Link state for fiber/DAC comes from the PCS */
+				dtsec_fdt_find_pcs(dev, sc, enet_node);
 
 				/* Register to receive module/link events */
 				SFF_REGISTER_UPSTREAM(sfp_dev,

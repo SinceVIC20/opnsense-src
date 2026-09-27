@@ -156,6 +156,10 @@ struct dtsec_softc {
 	/* Standalone ifmedia for SFP+ ports (no mii); module-derived list. */
 	struct ifmedia			sc_ifmedia;
 	bool				sc_ifmedia_ready;
+
+	/* Kept last so the fields above stay where cdx.ko expects them. */
+	device_t			sc_pcs_mdio;	/* 10G PCS MDIO bus, or NULL */
+	int				sc_pcs_addr;	/* PCS address on that bus */
 };
 /** @} */
 
@@ -215,6 +219,9 @@ void		dtsec_miibus_statchg(device_t dev);
  */
 struct sfp_upstream_ops;
 extern const struct sfp_upstream_ops dtsec_sfp_ops;
+
+/* Tick period: 1 s, or 250 ms on ports whose link comes from the PCS */
+#define	DTSEC_TICK(sc)	((sc)->sc_pcs_mdio != NULL ? hz / 4 : hz)
 /** @} */
 
 #endif /* IF_DTSEC_H_ */
