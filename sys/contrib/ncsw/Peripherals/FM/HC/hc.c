@@ -83,6 +83,9 @@
 #define SIZE_OF_HC_FRAME_READ_OR_CC_DYNAMIC 16
 
 #define HC_CMD_POOL_SIZE                    (INTG_MAX_NUM_OF_CORES)
+/* Preserve the Linux wrapper's former one-second confirmation allowance. */
+#define HC_CONFIRM_POLLS                    10000
+#define HC_CONFIRM_POLL_US                  100
 
 #define BUILD_FD(len)                     \
 do {                                      \
@@ -210,7 +213,7 @@ static __inline__ t_Error EnQFrm(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqN
 {
     t_Error     err = E_OK;
     uint32_t    intFlags;
-    uint32_t    timeout=100;
+    uint32_t    timeout = HC_CONFIRM_POLLS;
 
     intFlags = FmPcdLock(p_FmHc->h_FmPcd);
     ASSERT_COND(!p_FmHc->enqueued[seqNum]);
@@ -225,7 +228,7 @@ static __inline__ t_Error EnQFrm(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqN
         RETURN_ERROR(MINOR, err, ("HC enqueue failed"));
 
     while (p_FmHc->enqueued[seqNum] && --timeout)
-        XX_UDelay(100);
+        XX_UDelay(HC_CONFIRM_POLL_US);
 
     if (!timeout)
     {
