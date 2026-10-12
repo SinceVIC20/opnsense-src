@@ -148,6 +148,7 @@ typedef struct t_FmHc {
     e_HcBufState                bufState[HC_CMD_POOL_SIZE];
     bool                        failed;       /* Ambiguous completion: reset required. */
     bool                        quiescing;    /* No new borrowers during teardown. */
+    uint32_t                    refused;      /* Commands refused after a timeout. */
     t_HcFrame                   *p_Frm[HC_CMD_POOL_SIZE];
 } t_FmHc;
 
@@ -241,17 +242,35 @@ static __inline__ void PutBuf(t_FmHc *p_FmHc, t_HcFrame *p_Buf, uint32_t seqNum)
     HcUnlock(p_FmHc, intFlags);
 }
 
+/* True for 1, 10, 100, ... so a stream of the same error is logged sparingly. */
+static __inline__ bool LogThisCount(uint32_t n)
+{
+    while (n >= 10 && n % 10 == 0)
+        n /= 10;
+    return (n == 1);
+}
+
 static __inline__ t_Error EnQFrm(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqNum)
 {
     t_Error     err = E_OK;
     uint32_t    intFlags;
     uint32_t    timeout = HC_CONFIRM_POLLS;
+    uint32_t    refused;
 
     intFlags = HcLock(p_FmHc);
-    if (p_FmHc->failed || p_FmHc->quiescing)
+    if (p_FmHc->failed)
+    {
+        refused = ++p_FmHc->refused;
+        HcUnlock(p_FmHc, intFlags);
+        if (LogThisCount(refused))
+            RETURN_ERROR(MINOR, E_INVALID_STATE,
+                ("HC unavailable; reset required after timeout (%u commands refused)", refused));
+        return ERROR_CODE(E_INVALID_STATE);
+    }
+    if (p_FmHc->quiescing)
     {
         HcUnlock(p_FmHc, intFlags);
-        RETURN_ERROR(MINOR, E_INVALID_STATE, ("HC unavailable; reset required after timeout"));
+        RETURN_ERROR(MINOR, E_INVALID_STATE, ("HC unavailable during teardown"));
     }
     ASSERT_COND(p_FmHc->bufState[seqNum] == e_HC_BUF_READY);
     p_FmHc->bufState[seqNum] = e_HC_BUF_IN_FLIGHT;
@@ -1347,8 +1366,9 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
 
     PutBuf(p_FmHc, p_HcFrame, seqNum);
 
+    /* EnQFrm already logged it. */
     if (err != E_OK)
-        RETURN_ERROR(MINOR, err, NO_MSG);
+        return err;
 
     return E_OK;
 }
