@@ -1,3 +1,7 @@
+**Mono Gateway fork.** This is the kernel and base source for OPNsense 26.7 on
+the Mono Gateway, on the `mono-gateway-dev` branch. Build instructions are in the
+[opnsense-deps README](https://github.com/SinceVIC20/opnsense-deps#build-instructions).
+
 FreeBSD Source:
 ---------------
 This is the top level of the FreeBSD source directory.
