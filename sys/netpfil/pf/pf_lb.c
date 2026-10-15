@@ -196,11 +196,9 @@ pf_match_translation_rule(int rs_num, struct pf_test_ctx *ctx, struct pf_krulese
 		if (r->rtableid >= 0)
 			rtableid = r->rtableid;
 		if (r->anchor == NULL) {
-			if (r->action == PF_NONAT ||
-			    r->action == PF_NORDR ||
-			    r->action == PF_NOBINAT) {
-				*ctx->rm = NULL;
-			} else {
+			if (r->action != PF_NONAT &&
+			    r->action != PF_NORDR &&
+			    r->action != PF_NOBINAT) {
 				/*
 				 * found matching r
 				 */
@@ -1022,6 +1020,14 @@ pf_get_transaddr(struct pf_test_ctx *ctx, struct pf_krule *r,
 		if (pf_state_key_setup(pd, pd->nsport, pd->ndport, &ctx->sk,
 		    &ctx->nk))
 			return (PFRES_MEMORY);
+		if (ctx->sk == ctx->nk) {
+			ctx->nk = pf_state_key_clone(ctx->sk);
+			if (ctx->nk == NULL) {
+				uma_zfree(V_pf_state_key_z, ctx->sk);
+				ctx->sk = NULL;
+				return (PFRES_MEMORY);
+			}
+		}
 	}
 
 	switch (nat_action) {
@@ -1254,7 +1260,8 @@ out:
 	reason = PFRES_MAX;
 notrans:
 	uma_zfree(V_pf_state_key_z, ctx->nk);
-	uma_zfree(V_pf_state_key_z, ctx->sk);
+	if (ctx->nk != ctx->sk)
+		uma_zfree(V_pf_state_key_z, ctx->sk);
 	ctx->sk = ctx->nk = NULL;
 
 	return (reason);

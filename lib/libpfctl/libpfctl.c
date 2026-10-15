@@ -1955,6 +1955,7 @@ static struct snl_attr_parser ap_state[] = {
 	{ .type = PF_ST_RT_IFNAME, .off = _OUT(rt_ifname), .cb = snl_attr_store_ifname },
 	{ .type = PF_ST_SRC_NODE_FLAGS, .off = _OUT(src_node_flags), .cb = snl_attr_get_uint8 },
 	{ .type = PF_ST_RT_AF, .off = _OUT(rt_af), .cb = snl_attr_get_uint8 },
+	{ .type = PF_ST_RULE_LABEL, .off = _OUT(rule_label), .cb = snl_attr_store_ifname },
 };
 #undef _IN
 #undef _OUT
@@ -3484,7 +3485,8 @@ static struct  snl_attr_parser ap_tstats[] = {
 	{ .type = PF_TS_MATCH, .off = _OUT(pfrts_match), .cb = snl_attr_get_uint64 },
 	{. type = PF_TS_NOMATCH, .off = _OUT(pfrts_nomatch), .cb = snl_attr_get_uint64 },
 	{ .type = PF_TS_TZERO, .off = _OUT(pfrts_tzero), .cb = snl_attr_get_uint64 },
-	{ .type = PF_TS_REFCNT, .off = _OUT(pfrts_cnt), . arg = (void *)PFR_REFCNT_MAX, .cb = snl_attr_get_uint64_into_int_array },
+	{ .type = PF_TS_CNT, .off = _OUT(pfrts_cnt), .cb = snl_attr_get_uint64 },
+	{ .type = PF_TS_REFCNT, .off = _OUT(pfrts_refcnt), . arg = (void *)PFR_REFCNT_MAX, .cb = snl_attr_get_uint64_into_int_array },
 };
 #undef _OUT
 SNL_DECLARE_PARSER(tstats_parser, struct genlmsghdr, snl_f_p_empty, ap_tstats);

@@ -115,6 +115,8 @@ static bool	igc_if_needs_restart(if_ctx_t, enum iflib_restart_event);
 static void	igc_identify_hardware(if_ctx_t);
 static int	igc_allocate_pci_resources(if_ctx_t);
 static void	igc_free_pci_resources(if_ctx_t);
+static void	igc_disable_broken_l1_2(if_ctx_t);
+static void	igc_disable_pcie_aspm(if_ctx_t);
 static void	igc_reset(if_ctx_t);
 static int	igc_setup_interface(if_ctx_t);
 static int	igc_setup_msix(if_ctx_t);
@@ -547,6 +549,12 @@ igc_if_attach_pre(if_ctx_t ctx)
 	/* Determine hardware and mac info */
 	igc_identify_hardware(ctx);
 
+	/* Disable PCIe ASPM  */
+	igc_disable_pcie_aspm(ctx);
+
+	/* Apply device-specific PCIe L1.2 errata workarounds. */
+	igc_disable_broken_l1_2(ctx);
+
 	scctx->isc_tx_nsegments = IGC_MAX_SCATTER;
 	scctx->isc_nrxqsets_max =
 	    scctx->isc_ntxqsets_max = igc_set_num_queues(ctx);
@@ -789,6 +797,12 @@ igc_if_suspend(if_ctx_t ctx)
 static int
 igc_if_resume(if_ctx_t ctx)
 {
+	/*
+	 * PCIe config space, and with it L1.2, may have been reset
+	 * across the suspend/resume cycle.
+	 */
+	igc_disable_broken_l1_2(ctx);
+
 	igc_if_init(ctx);
 
 	return(0);
@@ -1270,7 +1284,7 @@ igc_if_media_change(if_ctx_t ctx)
 		device_printf(sc->dev, "Unsupported media type\n");
 	}
 
-	igc_if_init(ctx);
+	iflib_request_reset(sc->ctx);
 
 	return (0);
 }
@@ -1490,6 +1504,68 @@ igc_identify_hardware(if_ctx_t ctx)
 	}
 }
 
+/*********************************************************************
+ *
+ *  Intel's I225/I226 Specification Update, erratum 2, states that I225
+ *  devices can incorrectly enter L1 substates while CLKREQ# is asserted,
+ *  causing repeated L1-substate entry and exit.  Disable both ASPM and
+ *  PCI-PM L1.2, as the erratum can occur while idle or in D3.
+ *
+ *  I226 devices have a separate erratum where ASPM L1.2 exit latency can
+ *  exceed what the packet buffer can tolerate under load.  Disabling ASPM
+ *  L1.2 on the device itself works around the issue.
+ *
+ **********************************************************************/
+static void
+igc_disable_broken_l1_2(if_ctx_t ctx)
+{
+	device_t dev = iflib_get_dev(ctx);
+	struct igc_softc *sc = iflib_get_softc(ctx);
+	int cap;
+	uint32_t ctl1, mask;
+
+	if (igc_is_device_id_i225(&sc->hw))
+		mask = PCIM_L1PM_CTL1_ASPM_L1_2 |
+		    PCIM_L1PM_CTL1_PCIPM_L1_2;
+	else if (igc_is_device_id_i226(&sc->hw))
+		mask = PCIM_L1PM_CTL1_ASPM_L1_2;
+	else
+		return;
+
+	if (pci_find_extcap(dev, PCIZ_L1PM, &cap) != 0)
+		return;
+
+	ctl1 = pci_read_config(dev, cap + PCIR_L1PM_CTL1, 4);
+	ctl1 &= ~mask;
+	pci_write_config(dev, cap + PCIR_L1PM_CTL1, ctl1, 4);
+}
+
+/*********************************************************************
+ *
+ * In order to function reliably, ASPM needs to be disabled, in some cases
+ * strange link and througput issues exist otherwise.  For now, only apply
+ * this setting on I226 cards.
+ *
+ **********************************************************************/
+static void
+igc_disable_pcie_aspm(if_ctx_t ctx)
+{
+	device_t dev = iflib_get_dev(ctx);
+	struct igc_softc *sc = iflib_get_softc(ctx);
+	int cap;
+	uint32_t linkctl;
+
+	if (!igc_is_device_id_i226(&sc->hw))
+		return;
+
+	if (pci_find_cap(dev, PCIY_EXPRESS, &cap) != 0)
+		return;
+
+	linkctl = pci_read_config(dev, cap + PCIER_LINK_CTL, 2);
+	linkctl &= ~PCIEM_LINK_CTL_ASPMC;
+	pci_write_config(dev, cap + PCIER_LINK_CTL, linkctl, 2);
+}
+
 static int
 igc_allocate_pci_resources(if_ctx_t ctx)
 {
@@ -1668,8 +1744,9 @@ igc_free_pci_resources(if_ctx_t ctx)
 	if (sc->intr_type == IFLIB_INTR_MSIX)
 		iflib_irq_free(ctx, &sc->irq);
 
-	for (int i = 0; i < sc->rx_num_queues; i++, que++) {
-		iflib_irq_free(ctx, &que->que_irq);
+	if (que != NULL) {
+		for (int i = 0; i < sc->rx_num_queues; i++, que++)
+			iflib_irq_free(ctx, &que->que_irq);
 	}
 
 	if (sc->memory != NULL) {
@@ -3202,7 +3279,7 @@ igc_sysctl_dmac(SYSCTL_HANDLER_ARGS)
 			return (EINVAL);
 	}
 	/* Reinit the interface */
-	igc_if_init(sc->ctx);
+	iflib_request_reset(sc->ctx);
 	return (error);
 }
 
@@ -3223,7 +3300,7 @@ igc_sysctl_eee(SYSCTL_HANDLER_ARGS)
 		return (error);
 
 	sc->hw.dev_spec._i225.eee_disable = (value != 0);
-	igc_if_init(sc->ctx);
+	iflib_request_reset(sc->ctx);
 
 	return (0);
 }
