@@ -381,7 +381,26 @@ fman_hc_failed_sysctl(SYSCTL_HANDLER_ARGS)
 SYSCTL_PROC(_hw_fman, OID_AUTO, hc_failed,
     CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
     fman_hc_failed_sysctl, "I",
-    "1 after a host-command timeout; offload updates stop until reboot");
+    "1 while host commands are failing after a timeout");
+
+static int
+fman_hc_recoveries_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	u_int n;
+
+	n = FmHcRecoveries(fman_hc_handle);
+	return (sysctl_handle_int(oidp, &n, 0, req));
+}
+
+extern uint32_t fm_hc_confirm_polls;
+SYSCTL_UINT(_hw_fman, OID_AUTO, hc_confirm_polls, CTLFLAG_RWTUN,
+    &fm_hc_confirm_polls, 0,
+    "Host-command confirmation wait, in 100 us steps");
+
+SYSCTL_PROC(_hw_fman, OID_AUTO, hc_recoveries,
+    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    fman_hc_recoveries_sysctl, "IU",
+    "Times host commands worked again after a timeout");
 
 /*
  * QMan receive callback for HC confirmation frames.

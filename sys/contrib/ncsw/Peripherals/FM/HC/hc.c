@@ -86,6 +86,14 @@
 /* Preserve the Linux wrapper's former one-second confirmation allowance. */
 #define HC_CONFIRM_POLLS                    10000
 #define HC_CONFIRM_POLL_US                  100
+/* Settable through hw.fman.hc_confirm_polls, to test or diagnose timeouts. */
+uint32_t fm_hc_confirm_polls = HC_CONFIRM_POLLS;
+/* After a sync times out, try another sync this long later, doubling up to
+ * the maximum while it keeps failing. */
+#define HC_PROBE_FIRST_MS                   10000
+#define HC_PROBE_MAX_MS                     300000
+/* Lost frames allowed before giving up until reboot, keeping buffers free. */
+#define HC_MAX_ORPHANS                      (HC_CMD_POOL_SIZE / 2)
 
 #define BUILD_FD(len)                     \
 do {                                      \
@@ -146,9 +154,17 @@ typedef struct t_FmHc {
     uint32_t                    nextSeqNumLocation;         /* seqNum location in seqNum[] for next buffer */
     t_Handle                    h_Spinlock;
     e_HcBufState                bufState[HC_CMD_POOL_SIZE];
-    bool                        failed;       /* Ambiguous completion: reset required. */
+    bool                        failed;       /* A command timed out; refusing commands. */
+    bool                        latched;      /* Failed until reboot. */
+    bool                        probing;      /* A sync is testing whether HC works again. */
     bool                        quiescing;    /* No new borrowers during teardown. */
     uint32_t                    refused;      /* Commands refused after a timeout. */
+    uint32_t                    orphans;      /* Timed-out frames not confirmed yet. */
+    uint32_t                    failedAt;     /* ms when the first command timed out. */
+    uint32_t                    nextProbe;    /* ms when the next sync may try again. */
+    uint32_t                    probeWait;    /* ms between tries. */
+    uint32_t                    recoveries;   /* Times HC worked again after a timeout. */
+    uint32_t                    timeouts;     /* Confirmation timeouts. */
     t_HcFrame                   *p_Frm[HC_CMD_POOL_SIZE];
 } t_FmHc;
 
@@ -236,7 +252,10 @@ static __inline__ void PutBuf(t_FmHc *p_FmHc, t_HcFrame *p_Buf, uint32_t seqNum)
     ASSERT_COND(p_FmHc->bufState[seqNum] == e_HC_BUF_READY ||
                 p_FmHc->bufState[seqNum] == e_HC_BUF_IN_FLIGHT);
     if (p_FmHc->bufState[seqNum] == e_HC_BUF_IN_FLIGHT)
+    {
         p_FmHc->bufState[seqNum] = e_HC_BUF_ORPHANED;
+        p_FmHc->orphans++;
+    }
     else
         ReturnBuf(p_FmHc, seqNum);
     HcUnlock(p_FmHc, intFlags);
@@ -250,22 +269,37 @@ static __inline__ bool LogThisCount(uint32_t n)
     return (n == 1);
 }
 
-static __inline__ t_Error EnQFrm(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqNum)
+/*
+ * A sync changes nothing, so after one times out a later sync can safely test
+ * whether HC works again; CDX keeps unsynced deletes until a sync succeeds.
+ * Any other command that times out leaves HC failed until reboot.
+ */
+static t_Error EnQFrmEx(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqNum,
+                        bool isSync)
 {
     t_Error     err = E_OK;
     uint32_t    intFlags;
-    uint32_t    timeout = HC_CONFIRM_POLLS;
+    uint32_t    timeout = fm_hc_confirm_polls;
     uint32_t    refused;
+    uint32_t    now = 0;
+    uint32_t    downMs;
+    uint32_t    n;
 
     intFlags = HcLock(p_FmHc);
     if (p_FmHc->failed)
     {
-        refused = ++p_FmHc->refused;
-        HcUnlock(p_FmHc, intFlags);
-        if (LogThisCount(refused))
-            RETURN_ERROR(MINOR, E_INVALID_STATE,
-                ("HC unavailable; reset required after timeout (%u commands refused)", refused));
-        return ERROR_CODE(E_INVALID_STATE);
+        now = XX_CurrentTime();
+        if (!isSync || p_FmHc->latched || p_FmHc->probing ||
+            (int32_t)(now - p_FmHc->nextProbe) < 0)
+        {
+            refused = ++p_FmHc->refused;
+            HcUnlock(p_FmHc, intFlags);
+            if (LogThisCount(refused))
+                RETURN_ERROR(MINOR, E_INVALID_STATE,
+                    ("HC unavailable after a timeout (%u commands refused)", refused));
+            return ERROR_CODE(E_INVALID_STATE);
+        }
+        p_FmHc->probing = TRUE;
     }
     if (p_FmHc->quiescing)
     {
@@ -285,6 +319,7 @@ static __inline__ t_Error EnQFrm(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqN
         /* Enqueue errors mean rejection, never an accepted-command timeout. */
         intFlags = HcLock(p_FmHc);
         p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
+        p_FmHc->probing = FALSE;
         HcUnlock(p_FmHc, intFlags);
         RETURN_ERROR(MINOR, err, ("HC enqueue failed"));
     }
@@ -294,21 +329,59 @@ static __inline__ t_Error EnQFrm(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqN
         intFlags = HcLock(p_FmHc);
         if (p_FmHc->bufState[seqNum] == e_HC_BUF_READY)
         {
+            if (!p_FmHc->probing)
+            {
+                HcUnlock(p_FmHc, intFlags);
+                return E_OK;
+            }
+            p_FmHc->probing = FALSE;
+            p_FmHc->failed = FALSE;
+            n = ++p_FmHc->recoveries;
+            downMs = XX_CurrentTime() - p_FmHc->failedAt;
             HcUnlock(p_FmHc, intFlags);
+            if (LogThisCount(n))
+                XX_Print("FM HC: host commands working again after %u ms (%u times)\n",
+                         downMs, n);
             return E_OK;
         }
         if (!timeout--)
         {
             /* A late confirmation can reclaim the frame, but cannot repair
-             * caller software state. Do not reopen HC; recovery requires a
-             * board reset. */
-            p_FmHc->failed = TRUE;
+             * the caller's software state, so only a sync may reopen HC. */
+            now = XX_CurrentTime();
+            if (p_FmHc->probing)
+            {
+                p_FmHc->probing = FALSE;
+                p_FmHc->probeWait = MIN(p_FmHc->probeWait * 2, HC_PROBE_MAX_MS);
+            }
+            else
+            {
+                p_FmHc->failed = TRUE;
+                p_FmHc->failedAt = now;
+                p_FmHc->probeWait = HC_PROBE_FIRST_MS;
+            }
+            p_FmHc->nextProbe = now + p_FmHc->probeWait;
+            if (!isSync || p_FmHc->orphans + 1 > HC_MAX_ORPHANS)
+                p_FmHc->latched = TRUE;
+            n = ++p_FmHc->timeouts;
+            if (p_FmHc->latched)
+            {
+                HcUnlock(p_FmHc, intFlags);
+                RETURN_ERROR(MINOR, E_TIMEOUT, ("HC confirmation timed out; board reset required"));
+            }
             HcUnlock(p_FmHc, intFlags);
-            RETURN_ERROR(MINOR, E_TIMEOUT, ("HC confirmation timed out; board reset required"));
+            if (LogThisCount(n))
+                RETURN_ERROR(MINOR, E_TIMEOUT, ("HC confirmation timed out (%u times)", n));
+            return ERROR_CODE(E_TIMEOUT);
         }
         HcUnlock(p_FmHc, intFlags);
         XX_UDelay(HC_CONFIRM_POLL_US);
     }
+}
+
+static __inline__ t_Error EnQFrm(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqNum)
+{
+    return EnQFrmEx(p_FmHc, p_FmFd, seqNum, FALSE);
 }
 
 
@@ -430,6 +503,20 @@ bool FmHcIsFailed(t_Handle h_FmHc)
     return failed;
 }
 
+uint32_t FmHcRecoveries(t_Handle h_FmHc)
+{
+    t_FmHc *p_FmHc = (t_FmHc *)h_FmHc;
+    uint32_t flags;
+    uint32_t n;
+
+    if (!p_FmHc)
+        return 0;
+    flags = HcLock(p_FmHc);
+    n = p_FmHc->recoveries;
+    HcUnlock(p_FmHc, flags);
+    return n;
+}
+
 t_Error FmHcFree(t_Handle h_FmHc)
 {
     t_FmHc  *p_FmHc = (t_FmHc*)h_FmHc;
@@ -498,6 +585,8 @@ void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
     t_HcFrame   *p_HcFrame;
     uint32_t    intFlags;
     uint32_t    seqNum;
+    uint32_t    lateMs = 0xffffffff;
+    uint32_t    n = 0;
 
     ASSERT_COND(p_FmHc);
 
@@ -513,11 +602,27 @@ void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
         (p_FmHc->bufState[seqNum] != e_HC_BUF_IN_FLIGHT &&
          p_FmHc->bufState[seqNum] != e_HC_BUF_ORPHANED))
         REPORT_ERROR(MINOR, E_INVALID_FRAME, ("Not an Host-Command frame received!"));
-    else if (p_FmHc->bufState[seqNum] == e_HC_BUF_ORPHANED)
-        ReturnBuf(p_FmHc, seqNum);
     else
-        p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
+    {
+        if (p_FmHc->bufState[seqNum] == e_HC_BUF_ORPHANED)
+        {
+            ReturnBuf(p_FmHc, seqNum);
+            p_FmHc->orphans--;
+        }
+        else
+            p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
+        /* A confirmation while failed means a command finished late. */
+        if (p_FmHc->failed && !p_FmHc->latched && !p_FmHc->probing)
+        {
+            p_FmHc->failed = FALSE;
+            n = ++p_FmHc->recoveries;
+            lateMs = XX_CurrentTime() - p_FmHc->failedAt;
+        }
+    }
     HcUnlock(p_FmHc, intFlags);
+    if (lateMs != 0xffffffff && LogThisCount(n))
+        XX_Print("FM HC: late confirmation %u ms after the timeout, host commands working again (%u times)\n",
+                 lateMs, n);
 }
 
 t_Error FmHcPcdKgSetScheme(t_Handle                    h_FmHc,
@@ -1362,7 +1467,7 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
 
     BUILD_FD(sizeof(t_HcFrame));
 
-    err = EnQFrm(p_FmHc, &fmFd, seqNum);
+    err = EnQFrmEx(p_FmHc, &fmFd, seqNum, TRUE);
 
     PutBuf(p_FmHc, p_HcFrame, seqNum);
 
