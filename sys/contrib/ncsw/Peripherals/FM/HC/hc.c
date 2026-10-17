@@ -83,8 +83,8 @@
 #define SIZE_OF_HC_FRAME_READ_OR_CC_DYNAMIC 16
 
 #define HC_CMD_POOL_SIZE                    (INTG_MAX_NUM_OF_CORES)
-/* Preserve the Linux wrapper's former one-second confirmation allowance. */
-#define HC_CONFIRM_POLLS                    10000
+/* Three seconds: in the field a confirmation has come back just over one second late. */
+#define HC_CONFIRM_POLLS                    30000
 #define HC_CONFIRM_POLL_US                  100
 /* Settable through hw.fman.hc_confirm_polls, to test or diagnose timeouts. */
 uint32_t fm_hc_confirm_polls = HC_CONFIRM_POLLS;
