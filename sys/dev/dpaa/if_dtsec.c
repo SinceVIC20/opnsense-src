@@ -1065,6 +1065,21 @@ dtsec_sysctl_diag(SYSCTL_HANDLER_ARGS)
 				    (unsigned long long)ms.ifOutPkts,
 				    (unsigned long long)ms.ifOutOctets,
 				    (unsigned long long)ms.ifOutErrors);
+				/* rxErr splits into CRC errors and FIFO-full drops. */
+				printf("%s: MAC: pauseRx=%llu pauseTx=%llu "
+				    "rxDrop=%llu rxCrc=%u rxAlign=%llu "
+				    "rxOversize=%llu rxJabber=%llu "
+				    "rxFrag=%llu\n",
+				    if_name(sc->sc_ifnet),
+				    (unsigned long long)ms.reStatPause,
+				    (unsigned long long)ms.teStatPause,
+				    (unsigned long long)ms.eStatsDropEvents,
+				    sc->sc_mem != NULL ? be32toh(
+				        bus_read_4(sc->sc_mem, 0x128)) : 0,
+				    (unsigned long long)ms.eStatCRCAlignErrors,
+				    (unsigned long long)ms.eStatOversizePkts,
+				    (unsigned long long)ms.eStatJabbers,
+				    (unsigned long long)ms.eStatFragments);
 			}
 		}
 		/* MEMAC register dump for link debugging */
@@ -1084,6 +1099,12 @@ dtsec_sysctl_diag(SYSCTL_HANDLER_ARGS)
 			    (ifmode & 0x3) == 2 ? "GMII/1G" :
 			    (ifmode & 0x3) == 4 ? "RGMII" : "unknown",
 			    ifstat, ievent);
+			printf("%s: MEMAC pause_quanta=0x%08x "
+			    "pause_thresh=0x%08x rx_pause_status=0x%08x\n",
+			    if_name(sc->sc_ifnet),
+			    be32toh(bus_read_4(sc->sc_mem, 0x054)),
+			    be32toh(bus_read_4(sc->sc_mem, 0x064)),
+			    be32toh(bus_read_4(sc->sc_mem, 0x074)));
 		}
 		/* SFP state (managed by sfp_fdt) */
 		if (sc->sc_sfp_dev != NULL) {
