@@ -75,6 +75,10 @@ device		sff			# Small Form Factor Transceivers (SFP+)
 
 # caam is built as an out-of-tree module in opnsense-deps/drivers/caam/
 
+# ARMv8 ChaCha20-Poly1305 for WireGuard. wg(4) picks its crypto driver
+# once at load, so this must be in the kernel, not a module.
+device		ossl
+
 # Packet filter
 device		pf
 device		pflog
