@@ -994,6 +994,68 @@ dtsec_sysctl_bman_free(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_int(oidp, &count, 0, req));
 }
 
+#if (DPAA_VERSION >= 11)
+/* The MAC's own PCS for SGMII and 1000BASE-X (memac.h is not public). */
+t_Error	MEMAC_MII_ReadPhyReg(t_Handle, uint8_t, uint8_t, uint16_t *);
+t_Error	MEMAC_MII_WritePhyReg(t_Handle, uint8_t, uint8_t, uint16_t);
+
+static bool
+dtsec_has_sgmii_pcs(struct dtsec_softc *sc)
+{
+
+	return (sc->sc_mach != NULL &&
+	    ENET_INTERFACE_FROM_MODE(sc->sc_mac_enet_mode) == e_ENET_IF_SGMII);
+}
+
+static void
+dtsec_pcs_diag(struct dtsec_softc *sc)
+{
+	uint16_t bmcr, bmsr, lpar, ifmode;
+
+	if (!dtsec_has_sgmii_pcs(sc))
+		return;
+	/* Link status is latched low: the second read is the current state. */
+	if (MEMAC_MII_ReadPhyReg(sc->sc_mach, 0, MII_BMCR, &bmcr) != E_OK ||
+	    MEMAC_MII_ReadPhyReg(sc->sc_mach, 0, MII_BMSR, &bmsr) != E_OK ||
+	    MEMAC_MII_ReadPhyReg(sc->sc_mach, 0, MII_BMSR, &bmsr) != E_OK ||
+	    MEMAC_MII_ReadPhyReg(sc->sc_mach, 0, MII_ANLPAR, &lpar) != E_OK ||
+	    MEMAC_MII_ReadPhyReg(sc->sc_mach, 0, 0x14, &ifmode) != E_OK) {
+		printf("%s: PCS: read failed\n", if_name(sc->sc_ifnet));
+		return;
+	}
+	printf("%s: PCS: BMCR=0x%04x [AN %s] BMSR=0x%04x [link %s, AN %s] "
+	    "partner=0x%04x IF_MODE=0x%04x fixed-link=%s\n",
+	    if_name(sc->sc_ifnet), bmcr,
+	    (bmcr & BMCR_AUTOEN) ? "on" : "off", bmsr,
+	    (bmsr & BMSR_LINK) ? "up" : "down",
+	    (bmsr & BMSR_ACOMP) ? "done" : "not done",
+	    lpar, ifmode, sc->sc_fixed_link ? "yes" : "no");
+}
+
+/* Turns 1000BASE-X autonegotiation on or off, for links where the far end differs. */
+static int
+dtsec_sysctl_pcs_autoneg(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	uint16_t bmcr;
+	int val, error;
+
+	if (MEMAC_MII_ReadPhyReg(sc->sc_mach, 0, MII_BMCR, &bmcr) != E_OK)
+		return (EIO);
+	val = (bmcr & BMCR_AUTOEN) != 0;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error || req->newptr == NULL)
+		return (error);
+
+	bmcr = BMCR_FDX | BMCR_SPEED1;
+	if (val != 0)
+		bmcr |= BMCR_AUTOEN | BMCR_STARTNEG;
+	if (MEMAC_MII_WritePhyReg(sc->sc_mach, 0, MII_BMCR, bmcr) != E_OK)
+		return (EIO);
+	return (0);
+}
+#endif
+
 static int
 dtsec_sysctl_diag(SYSCTL_HANDLER_ARGS)
 {
@@ -1107,6 +1169,9 @@ dtsec_sysctl_diag(SYSCTL_HANDLER_ARGS)
 			    be32toh(bus_read_4(sc->sc_mem, 0x064)),
 			    be32toh(bus_read_4(sc->sc_mem, 0x074)));
 		}
+#if (DPAA_VERSION >= 11)
+		dtsec_pcs_diag(sc);
+#endif
 		/* SFP state (managed by sfp_fdt) */
 		if (sc->sc_sfp_dev != NULL) {
 			printf("%s: SFP: module=%s link=%s speed=%d\n",
@@ -1478,6 +1543,14 @@ dtsec_attach(device_t dev)
 		    "diag", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 		    sc, 0, dtsec_sysctl_diag, "I",
 		    "Write 1 to dump DQRR + BMan state to dmesg");
+#if (DPAA_VERSION >= 11)
+		if (sc->sc_mac_enet_mode & ENET_IF_SGMII_BASEX)
+			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+			    "pcs_autoneg",
+			    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+			    sc, 0, dtsec_sysctl_pcs_autoneg, "I",
+			    "1000BASE-X autonegotiation (0 = off, 1 = on)");
+#endif
 
 		if (sc->sc_sfp_dev != NULL) {
 			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree),
