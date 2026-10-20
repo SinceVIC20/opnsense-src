@@ -221,6 +221,7 @@ dtsec_fm_mac_init(struct dtsec_softc *sc, uint8_t *mac)
 	params.f_Exception = dtsec_fm_mac_exception_callback;
 	params.h_App = sc;
 	params.h_Fm = sc->sc_fmh;
+	params.fixed = sc->sc_fixed_link;
 
 	sc->sc_mach = FM_MAC_Config(&params);
 	if (sc->sc_mach == NULL) {

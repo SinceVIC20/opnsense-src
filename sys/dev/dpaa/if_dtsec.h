@@ -77,6 +77,7 @@ struct dtsec_softc {
 	uint8_t				sc_mac_cell_index; /* raw DT cell-index */
 	uintptr_t			sc_mac_mem_offset;
 	e_EnetMode			sc_mac_enet_mode;
+	bool				sc_fixed_link;	/* DT fixed-link, no in-band AN */
 	int				sc_mac_mdio_irq;
 	uint8_t				sc_mac_addr[6];
 	int				sc_port_rx_hw_id;

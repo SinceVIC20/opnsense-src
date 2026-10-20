@@ -159,8 +159,12 @@ static void SetupSgmiiInternalPhyBaseX(t_Memac *p_Memac, uint8_t phyAddr)
     MEMAC_MII_WritePhyReg(p_Memac, phyAddr, 0x13, 0x002f);
     MEMAC_MII_WritePhyReg(p_Memac, phyAddr, 0x12, 0xaf08);
 
-    /* Restart AN */
-    tmpReg16 = PHY_SGMII_CR_DEF_VAL | PHY_SGMII_CR_RESET_AN;
+    if (!p_Memac->fixed)
+        /* Restart AN */
+        tmpReg16 = PHY_SGMII_CR_DEF_VAL | PHY_SGMII_CR_RESET_AN;
+    else
+        /* Fixed link: disable AN, as Linux does */
+        tmpReg16 = PHY_SGMII_CR_DEF_VAL & ~PHY_SGMII_CR_AN_EN;
     MEMAC_MII_WritePhyReg(p_Memac, phyAddr, 0x0, tmpReg16);
 
     /* Restore original enet mode */
@@ -1087,6 +1091,7 @@ t_Handle MEMAC_Config(t_FmMacParams *p_FmMacParam)
 
     p_Memac->enetMode       = p_FmMacParam->enetMode;
     p_Memac->macId          = p_FmMacParam->macId;
+    p_Memac->fixed          = p_FmMacParam->fixed;
     p_Memac->exceptions     = MEMAC_default_exceptions;
     p_Memac->f_Exception    = p_FmMacParam->f_Exception;
     p_Memac->f_Event        = p_FmMacParam->f_Event;

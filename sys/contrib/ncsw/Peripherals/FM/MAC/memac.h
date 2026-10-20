@@ -81,6 +81,7 @@ typedef struct
     t_EthHash                   *p_UnicastAddrHash;                  /**< Pointer to driver's individual address hash table  */
     bool                        debugMode;
     uint8_t                     macId;
+    bool                        fixed;
     uint32_t                    exceptions;
     struct memac_cfg            *p_MemacDriverParam;
 } t_Memac;
@@ -91,6 +92,7 @@ typedef struct
 
 /* Internal PHY Registers - SGMII */
 #define PHY_SGMII_CR_PHY_RESET          0x8000
+#define PHY_SGMII_CR_AN_EN              0x1000
 #define PHY_SGMII_CR_RESET_AN           0x0200
 #define PHY_SGMII_CR_DEF_VAL            0x1140
 #define PHY_SGMII_DEV_ABILITY_SGMII     0x4001

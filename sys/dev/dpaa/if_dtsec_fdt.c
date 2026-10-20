@@ -290,6 +290,7 @@ skip_phy:
 		    phy_type);
 		return (ENXIO);
 	}
+	sc->sc_fixed_link = OF_hasprop(enet_node, "fixed-link");
 
 	if (OF_getencprop(enet_node, "cell-index",
 	    (void *)&mac_id, sizeof(mac_id)) <= 0) {
