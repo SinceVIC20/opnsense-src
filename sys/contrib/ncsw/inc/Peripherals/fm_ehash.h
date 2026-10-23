@@ -452,8 +452,9 @@ struct en_ehash_insert_l3_hdr {
  * Remove first IP header (tunnel decap)
  * ---------------------------------------------------------------- */
 struct en_ehash_remove_first_ip_hdr {
-	uint32_t flags:8;
-	uint32_t stats_ptr:24;
+	/* One big-endian word: flags in the top byte, the 24-bit stats
+	 * offset below. Bitfields can't express this on little-endian. */
+	uint32_t word;
 } __attribute__((packed));
 
 /* ----------------------------------------------------------------

@@ -35,6 +35,8 @@
 #include <sys/kernel.h>
 #include <sys/systm.h>
 #include <sys/malloc.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
 #include <sys/endian.h>
 
 #include <vm/vm.h>
@@ -251,7 +253,8 @@ struct en_exthash_node {
 struct en_exthash_info {
 	uint32_t	flags;
 	void		*table_base;	/* DDR bucket array */
-	void		**pSpinlock;	/* per-bucket spinlock array */
+	struct mtx	*locks;		/* bucket locks, shared by stripe */
+	uint32_t	lockmask;	/* bucket index -> lock index */
 	void		*h_Ad;		/* MURAM AD pointer (set by copy_td_to_ccbase) */
 	struct en_exthash_node node;	/* local copy of table descriptor */
 	uint32_t	tablesize;
@@ -268,6 +271,20 @@ struct en_exthash_info {
 };
 
 MALLOC_DEFINE(M_EHASH, "ehash", "CDX external hash table");
+
+/*
+ * Buckets share a small set of locks. A lock per bucket cost one 32-byte
+ * mutex per bucket, about 930,000 of them (30 MB) for the tables cdx builds;
+ * every lock holder edits one bucket and takes no other.
+ */
+#define	EHASH_LOCK_STRIPES	64
+
+static struct mtx *
+ehash_bucket_lock(struct en_exthash_info *info, uint16_t index)
+{
+
+	return (&info->locks[index & info->lockmask]);
+}
 
 /* ----------------------------------------------------------------
  * Internal buffer pool management — allocated once in MURAM
@@ -444,14 +461,10 @@ delete_ehash_info(struct en_exthash_info *info)
 	if (info == NULL)
 		return;
 
-	if (info->pSpinlock != NULL) {
-		for (ii = 0; ii <= info->hashmask; ii++) {
-			if (*(info->pSpinlock + ii) != NULL)
-				XX_FreeSpinlock(*(info->pSpinlock + ii));
-			else
-				break;
-		}
-		free(info->pSpinlock, M_EHASH);
+	if (info->locks != NULL) {
+		for (ii = 0; ii <= info->lockmask; ii++)
+			mtx_destroy(&info->locks[ii]);
+		free(info->locks, M_EHASH);
 	}
 
 	if (info->table_base != NULL)
@@ -525,23 +538,13 @@ ExternalHashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
 		goto err_ret;
 	}
 
-	/* Allocate per-bucket spinlocks (CPU-only, no DMA) */
-	info->pSpinlock = malloc(
-	    sizeof(t_Handle) * (info->hashmask + 1),
+	/* Bucket locks (CPU-only, no DMA); both counts are powers of 2. */
+	info->lockmask = MIN(info->hashmask + 1, EHASH_LOCK_STRIPES) - 1;
+	info->locks = mallocarray(info->lockmask + 1, sizeof(struct mtx),
 	    M_EHASH, M_WAITOK | M_ZERO);
-	if (info->pSpinlock == NULL) {
-		REPORT_ERROR(MAJOR, E_NO_MEMORY, ("spinlock array"));
-		goto err_ret;
-	}
-
-	for (ii = 0; ii <= info->hashmask; ii++) {
-		*(info->pSpinlock + ii) = XX_InitSpinlock();
-		if (*(info->pSpinlock + ii) == NULL) {
-			REPORT_ERROR(MAJOR, E_NO_MEMORY,
-			    ("bucket spinlock"));
-			goto err_ret;
-		}
-	}
+	for (ii = 0; ii <= info->lockmask; ii++)
+		mtx_init(&info->locks[ii], "ehash bucket", NULL,
+		    MTX_DEF | MTX_DUPOK);
 
 	/*
 	 * Allocate DDR hash table (bucket array).
@@ -797,8 +800,7 @@ ExternalHashTableAddKey(void *h_HashTbl, uint8_t keySize, void *tbl_entry)
 	struct en_exthash_tbl_entry *new_entry;
 	uint16_t index;
 	struct en_exthash_bucket *bucket;
-	t_Handle *h_Spinlock;
-	uint32_t intFlags;
+	struct mtx *lock;
 	int retval;
 	uint64_t phyaddr;
 
@@ -808,10 +810,10 @@ ExternalHashTableAddKey(void *h_HashTbl, uint8_t keySize, void *tbl_entry)
 	new_entry = (struct en_exthash_tbl_entry *)tbl_entry;
 	info = (struct en_exthash_info *)h_HashTbl;
 
-	if (info->table_base == NULL || info->pSpinlock == NULL) {
+	if (info->table_base == NULL || info->locks == NULL) {
 		REPORT_ERROR(MAJOR, E_INVALID_HANDLE,
-		    ("hash table not initialized (table_base=%p pSpinlock=%p)",
-		    info->table_base, info->pSpinlock));
+		    ("hash table not initialized (table_base=%p locks=%p)",
+		    info->table_base, info->locks));
 		return (-1);
 	}
 
@@ -820,8 +822,8 @@ ExternalHashTableAddKey(void *h_HashTbl, uint8_t keySize, void *tbl_entry)
 
 	bucket = (struct en_exthash_bucket *)info->table_base + index;
 
-	h_Spinlock = *(info->pSpinlock + index);
-	intFlags = XX_LockIntrSpinlock(h_Spinlock);
+	lock = ehash_bucket_lock(info, index);
+	mtx_lock(lock);
 
 	retval = index;
 	phyaddr = bucket->h;
@@ -855,7 +857,7 @@ ExternalHashTableAddKey(void *h_HashTbl, uint8_t keySize, void *tbl_entry)
 	bucket->h = SwapUint64(phyaddr);
 
 func_ret:
-	XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
+	mtx_unlock(lock);
 	return (retval);
 }
 
@@ -871,8 +873,7 @@ ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index, void *tbl_entry)
 	struct en_exthash_bucket *bucket;
 	struct en_exthash_tbl_entry *entry;
 	struct en_exthash_tbl_entry *temp_entry;
-	t_Handle *h_Spinlock;
-	uint32_t intFlags;
+	struct mtx *lock;
 	uint64_t phyaddr;
 	uint64_t update_entry;
 
@@ -881,7 +882,7 @@ ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index, void *tbl_entry)
 
 	info = (struct en_exthash_info *)h_HashTbl;
 
-	if (info->table_base == NULL || info->pSpinlock == NULL) {
+	if (info->table_base == NULL || info->locks == NULL) {
 		REPORT_ERROR(MAJOR, E_INVALID_HANDLE,
 		    ("hash table not initialized in DeleteKey"));
 		return (-1);
@@ -897,8 +898,8 @@ ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index, void *tbl_entry)
 	bucket = (struct en_exthash_bucket *)info->table_base + index;
 	entry = (struct en_exthash_tbl_entry *)tbl_entry;
 
-	h_Spinlock = *(info->pSpinlock + index);
-	intFlags = XX_LockIntrSpinlock(h_Spinlock);
+	lock = ehash_bucket_lock(info, index);
+	mtx_lock(lock);
 
 	/* Mark entry as invalid for microcode */
 	update_entry = SwapUint64(entry->hashentry.next_entry);
@@ -927,7 +928,7 @@ ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index, void *tbl_entry)
 		}
 	}
 
-	XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
+	mtx_unlock(lock);
 
 	if (FmPcdHcSync(info->pcd)) {
 		static volatile u_int unsynced;
