@@ -345,8 +345,9 @@ qman_attach(device_t dev)
 	qp.errIrq = (uintptr_t)sc->sc_ires;
 	qp.partFqidBase = QMAN_FQID_BASE;
 	qp.partNumOfFqids = QMAN_MAX_FQIDS;
+	/* All congestion groups belong to this partition (qman_cg_create()). */
 	qp.partCgsBase = 0;
-	qp.partNumOfCgs = 0;
+	qp.partNumOfCgs = QM_MAX_NUM_OF_CGS;
 
 #ifdef __aarch64__
 	/*
@@ -584,6 +585,16 @@ qman_fqr_create_ctx(uint32_t fqids_num, e_QmFQChannel channel, uint8_t wq,
     bool force_fqid, uint32_t fqid_or_align, bool prefer_in_cache,
     t_QmContextA *p_context_a, t_QmContextB *p_context_b)
 {
+
+	return (qman_fqr_create_ctx_cg(fqids_num, channel, wq, force_fqid,
+	    fqid_or_align, prefer_in_cache, p_context_a, p_context_b, NULL));
+}
+
+t_Handle
+qman_fqr_create_ctx_cg(uint32_t fqids_num, e_QmFQChannel channel, uint8_t wq,
+    bool force_fqid, uint32_t fqid_or_align, bool prefer_in_cache,
+    t_QmContextA *p_context_a, t_QmContextB *p_context_b, t_Handle cg)
+{
 	struct qman_softc *sc;
 	t_QmFqrParams fqr;
 	t_Handle fqrh, portal;
@@ -619,8 +630,8 @@ qman_fqr_create_ctx(uint32_t fqids_num, e_QmFQChannel channel, uint8_t wq,
 	else
 		fqr.qs.nonFrcQs.align = fqid_or_align;
 
-	fqr.congestionAvoidanceEnable = FALSE;
-	fqr.congestionAvoidanceParams.h_QmCg = 0;
+	fqr.congestionAvoidanceEnable = (cg != NULL);
+	fqr.congestionAvoidanceParams.h_QmCg = cg;
 	fqr.congestionAvoidanceParams.overheadAccountingLength = 0;
 	fqr.congestionAvoidanceParams.fqTailDropThreshold = 0;
 
@@ -664,6 +675,63 @@ qman_fqr_free(t_Handle fqr)
 	thread_unlock(curthread);
 
 	return (error);
+}
+
+/*
+ * A congestion group that refuses enqueues once its queues hold the given
+ * number of frames. Groups are made and freed on CPU 0's portal.
+ */
+t_Handle
+qman_cg_create(uint32_t frames)
+{
+	struct qman_softc *sc;
+	t_QmCgParams cgp;
+	t_Handle cg, portal;
+
+	sc = qman_sc;
+	cg = NULL;
+
+	thread_lock(curthread);
+	sched_bind(curthread, 0);
+	thread_unlock(curthread);
+
+	portal = qman_portal_setup(sc);
+	if (portal != NULL) {
+		memset(&cgp, 0, sizeof(cgp));
+		cgp.h_Qm = sc->sc_qh;
+		cgp.h_QmPortal = portal;
+		cgp.frameCount = TRUE;
+		cgp.tailDropEnable = TRUE;
+		cgp.threshold = frames;
+		cg = QM_CG_Create(&cgp);
+	}
+	if (cg == NULL)
+		device_printf(sc->sc_dev,
+		    "could not create congestion group\n");
+
+	thread_lock(curthread);
+	sched_unbind(curthread);
+	thread_unlock(curthread);
+
+	return (cg);
+}
+
+void
+qman_cg_free(t_Handle cg)
+{
+
+	if (cg == NULL)
+		return;
+
+	thread_lock(curthread);
+	sched_bind(curthread, 0);
+	thread_unlock(curthread);
+
+	QM_CG_Free(cg);
+
+	thread_lock(curthread);
+	sched_unbind(curthread);
+	thread_unlock(curthread);
 }
 
 t_Error

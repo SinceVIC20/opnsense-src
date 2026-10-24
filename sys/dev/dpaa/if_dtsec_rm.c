@@ -126,6 +126,12 @@ enum dtsec_rm_pool_params {
 	 */
 	DTSEC_RM_POOL_RX_REFILL_THRESH	= 1024,
 	DTSEC_RM_POOL_RX_REFILL_COUNT	= 256,
+	/*
+	 * Frames waiting for the CPU hold pool buffers. Past this QMan drops
+	 * new ones, so a flood the CPU can't keep up with leaves the port
+	 * buffers to receive into. ASK's value (d1adb10, 0b2a8c8).
+	 */
+	DTSEC_RM_RX_CG_FRAMES		= 1280,
 
 	DTSEC_RM_POOL_FI_LOW_MARK	= 16,
 	DTSEC_RM_POOL_FI_HIGH_MARK	= 64,
@@ -265,6 +271,19 @@ dtsec_rm_fm_port_rx_init(struct dtsec_softc *sc, int unit)
 	 * 4KB to prevent FMan hang under heavy traffic. */
 	FM_PORT_ConfigBCBWorkaround(sc->sc_rxph);
 #endif
+
+	/*
+	 * The default 24 KB FIFO overflows on a 10G line-rate burst while
+	 * FMan classifies it, dropping frames as physical errors. 48 KB
+	 * loses none (ASK a54cfb9) and fits FMan's total FIFO.
+	 */
+	if (params.portType == e_FM_PORT_TYPE_RX_10G) {
+		t_FmPortRsrc fifo = { .num = 0xc000, .extra = 0 };
+
+		if (FM_PORT_ConfigSizeOfFifo(sc->sc_rxph, &fifo) != E_OK)
+			device_printf(sc->sc_dev,
+			    "couldn't enlarge the RX FIFO, using the default\n");
+	}
 
 	error = FM_PORT_Init(sc->sc_rxph);
 	if (error != E_OK) {
@@ -928,6 +947,18 @@ dtsec_rm_fqr_rx_free(struct dtsec_softc *sc)
 			sc->sc_rx_fqr[i] = NULL;
 		}
 	}
+
+	qman_cg_free(sc->sc_rx_cg);
+	sc->sc_rx_cg = NULL;
+}
+
+t_Handle
+dtsec_rm_rx_cg(if_t ifp)
+{
+	struct dtsec_softc *sc;
+
+	sc = if_getsoftc(ifp);
+	return (sc != NULL ? sc->sc_rx_cg : NULL);
 }
 
 /*
@@ -997,16 +1028,22 @@ dtsec_rm_fqr_rx_init(struct dtsec_softc *sc)
 	 * 127 FQRs use force_fqid for contiguous FQIDs.
 	 */
 
+	/* Without a group the queues still work, just with no limit. */
+	sc->sc_rx_cg = qman_cg_create(DTSEC_RM_RX_CG_FRAMES);
+	if (sc->sc_rx_cg == NULL)
+		device_printf(sc->sc_dev,
+		    "no limit on frames waiting for the CPU\n");
+
 	/* FQID 0: allocate with alignment to get contiguous base */
 	fqr = qman_fqr_create(1,
 	    (e_QmFQChannel)(e_QM_FQ_CHANNEL_SWPORTAL0),
 	    DTSEC_RM_FQR_RX_WQ, false,
 	    DTSEC_RX_QUEUES,  /* alignment */
-	    false, false, true, false, 0, 0, 0);
+	    false, false, true, sc->sc_rx_cg != NULL, sc->sc_rx_cg, 0, 0);
 	if (fqr == NULL) {
 		device_printf(sc->sc_dev,
 		    "could not create aligned RX FQR for FQID 0\n");
-		return (EIO);
+		goto fail;
 	}
 
 	sc->sc_rx_fqr[0] = fqr;
@@ -1019,7 +1056,7 @@ dtsec_rm_fqr_rx_init(struct dtsec_softc *sc)
 		    "could not register RX callback for FQID 0\n");
 		qman_fqr_free(fqr);
 		sc->sc_rx_fqr[0] = NULL;
-		return (EIO);
+		goto fail;
 	}
 
 	/* FQIDs 1..N-1: force-allocate, round-robin across CPUs */
@@ -1030,7 +1067,8 @@ dtsec_rm_fqr_rx_init(struct dtsec_softc *sc)
 
 		fqr = qman_fqr_create(1, channel, DTSEC_RM_FQR_RX_WQ,
 		    true, base_fqid + i,
-		    false, false, true, false, 0, 0, 0);
+		    false, false, true, sc->sc_rx_cg != NULL, sc->sc_rx_cg,
+		    0, 0);
 		if (fqr == NULL) {
 			device_printf(sc->sc_dev,
 			    "could not create RX FQR %d "

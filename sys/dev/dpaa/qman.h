@@ -273,6 +273,26 @@ t_Handle qman_fqr_create_ctx(uint32_t fqids_num, e_QmFQChannel channel,
     bool prefer_in_cache, t_QmContextA *p_context_a,
     t_QmContextB *p_context_b);
 
+/**
+ * Same as qman_fqr_create_ctx(), with the queues in congestion group cg
+ * (from qman_cg_create()), or in none when cg is NULL.
+ */
+t_Handle qman_fqr_create_ctx_cg(uint32_t fqids_num, e_QmFQChannel channel,
+    uint8_t wq, bool force_fqid, uint32_t fqid_or_align,
+    bool prefer_in_cache, t_QmContextA *p_context_a,
+    t_QmContextB *p_context_b, t_Handle cg);
+
+/**
+ * Create a congestion group that drops frames enqueued to its queues once
+ * they hold @frames frames between them. Returns NULL on failure.
+ */
+t_Handle qman_cg_create(uint32_t frames);
+
+/**
+ * Free a group from qman_cg_create(). Its queues must be freed first.
+ */
+void qman_cg_free(t_Handle cg);
+
 uint32_t qman_get_pfdr_in_use(void);
 uint32_t qman_get_sfdr_in_use(void);
 

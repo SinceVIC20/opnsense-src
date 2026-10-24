@@ -113,6 +113,7 @@ struct dtsec_softc {
 	/* RX Frame Queues — RSS hash distribution via dedicated channels */
 	t_Handle			sc_rx_fqr[DTSEC_RX_NUM_FQS];
 	uint32_t			sc_rx_fqid;
+	t_Handle			sc_rx_cg;	/* limit for frames waiting for the CPU */
 
 	/* Per-CPU TX Frame Queues */
 	t_Handle			sc_tx_fqs[DTSEC_TX_NUM_FQS];
@@ -197,6 +198,12 @@ e_FmPortType	dtsec_fm_port_tx_type(enum eth_dev_type type);
  */
 void		dtsec_rm_buf_free_external(uint8_t bpid, void *buf);
 void		dtsec_rm_pool_rx_refill_bpid(uint8_t bpid);
+
+/*
+ * The congestion group of a dtsec port's queues to the CPU, for CDX's
+ * distribution queues to join. NULL when the port has none.
+ */
+t_Handle	dtsec_rm_rx_cg(if_t ifp);
 /** @} */
 
 /**
