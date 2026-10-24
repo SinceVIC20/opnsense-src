@@ -3476,6 +3476,15 @@ uint32_t FM_PORT_GetBufferDataOffset(t_Handle h_FmPort)
     return p_FmPort->bufferOffsets.dataOffset;
 }
 
+uint32_t FM_PORT_GetSizeOfFifo(t_Handle h_FmPort)
+{
+    t_FmPort *p_FmPort = (t_FmPort*)h_FmPort;
+
+    SANITY_CHECK_RETURN_VALUE(p_FmPort, E_INVALID_HANDLE, 0);
+
+    return FmGetSizeOfFifo(p_FmPort->h_Fm, p_FmPort->hardwarePortId);
+}
+
 uint8_t * FM_PORT_GetBufferICInfo(t_Handle h_FmPort, char *p_Data)
 {
     t_FmPort *p_FmPort = (t_FmPort*)h_FmPort;

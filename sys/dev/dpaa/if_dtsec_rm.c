@@ -295,6 +295,10 @@ dtsec_rm_fm_port_rx_init(struct dtsec_softc *sc, int unit)
 		return (ENXIO);
 	}
 
+	if (params.portType == e_FM_PORT_TYPE_RX_10G)
+		device_printf(sc->sc_dev, "RX FIFO %u bytes\n",
+		    FM_PORT_GetSizeOfFifo(sc->sc_rxph));
+
 	/* Enable BMI statistics counters for PCD diagnostics */
 	FM_PORT_SetStatisticsCounters(sc->sc_rxph, TRUE);
 

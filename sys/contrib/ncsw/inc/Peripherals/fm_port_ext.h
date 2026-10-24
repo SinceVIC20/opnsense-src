@@ -1632,6 +1632,19 @@ t_Error FM_PORT_DumpRegs(t_Handle h_FmPort);
 uint32_t FM_PORT_GetBufferDataOffset(t_Handle h_FmPort);
 
 /**************************************************************************//**
+ @Function      FM_PORT_GetSizeOfFifo
+
+ @Description   Returns the FIFO size the BMI holds for the port now, in bytes.
+
+ @Param[in]     h_FmPort - FM PORT module descriptor
+
+ @Return        FIFO size in bytes, 0 if it can't be read.
+
+ @Cautions      Allowed only following FM_PORT_Init().
+*//***************************************************************************/
+uint32_t FM_PORT_GetSizeOfFifo(t_Handle h_FmPort);
+
+/**************************************************************************//**
  @Function      FM_PORT_GetBufferICInfo
 
  @Description   Returns the Internal Context offset from the beginning of the data buffer

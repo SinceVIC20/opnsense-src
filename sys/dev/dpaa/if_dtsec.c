@@ -1116,6 +1116,11 @@ dtsec_sysctl_diag(SYSCTL_HANDLER_ARGS)
 			    FM_PORT_GetCounter(sc->sc_txph,
 			        e_FM_PORT_COUNTERS_DEQ_CONFIRM));
 		}
+		/* What the hardware holds, to check a configured size took. */
+		printf("%s: FMan FIFO: rx=%u tx=%u bytes\n",
+		    if_name(sc->sc_ifnet),
+		    sc->sc_rxph != NULL ? FM_PORT_GetSizeOfFifo(sc->sc_rxph) : 0,
+		    sc->sc_txph != NULL ? FM_PORT_GetSizeOfFifo(sc->sc_txph) : 0);
 		if (sc->sc_mach != NULL) {
 			t_FmMacStatistics ms;
 			if (FM_MAC_GetStatistics(sc->sc_mach, &ms) == E_OK) {

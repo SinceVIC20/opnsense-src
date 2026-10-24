@@ -1189,6 +1189,7 @@ t_Error     FmSetSizeOfFifo(t_Handle    h_Fm,
                             uint32_t    *p_SizeOfFifo,
                             uint32_t    *p_ExtraSizeOfFifo,
                             bool        initialConfig);
+uint32_t    FmGetSizeOfFifo(t_Handle h_Fm, uint8_t hardwarePortId);
 
 t_Error     FmSetCongestionGroupPFCpriority(t_Handle    h_Fm,
                                             uint32_t    congestionGroupId,

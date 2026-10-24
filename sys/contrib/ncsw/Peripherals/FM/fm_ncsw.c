@@ -2589,6 +2589,17 @@ bool FmIsMaster(t_Handle h_Fm)
     return (p_Fm->guestId == NCSW_MASTER_ID);
 }
 
+/* FIFO size the BMI holds for a port now, in bytes (0 if not readable). */
+uint32_t FmGetSizeOfFifo(t_Handle h_Fm, uint8_t hardwarePortId)
+{
+    t_Fm *p_Fm = (t_Fm*)h_Fm;
+
+    if (!p_Fm->p_FmBmiRegs)
+        return 0;
+    return (uint32_t)fman_get_size_of_fifo(p_Fm->p_FmBmiRegs, hardwarePortId) *
+        BMI_FIFO_UNITS;
+}
+
 t_Error FmSetSizeOfFifo(t_Handle    h_Fm,
                         uint8_t     hardwarePortId,
                         uint32_t    *p_SizeOfFifo,
