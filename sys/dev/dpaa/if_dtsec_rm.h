@@ -38,6 +38,7 @@ int	dtsec_rm_if_transmit(if_t ifp, struct mbuf *m);
 
 int	dtsec_rm_pool_rx_init(struct dtsec_softc *sc);
 void	dtsec_rm_pool_rx_free(struct dtsec_softc *sc);
+void	dtsec_rm_pool_rx_watch(struct dtsec_softc *sc);
 
 int	dtsec_rm_fi_pool_init(struct dtsec_softc *sc);
 void	dtsec_rm_fi_pool_free(struct dtsec_softc *sc);

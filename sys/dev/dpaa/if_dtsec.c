@@ -596,6 +596,8 @@ dtsec_if_tick(void *arg)
 	if (sc->sc_mii != NULL)
 		mii_tick(sc->sc_mii);
 	dtsec_sfp_pcs_poll(sc);
+	if (sc->sc_mode == DTSEC_MODE_REGULAR)
+		dtsec_rm_pool_rx_watch(sc);
 
 	callout_reset(&sc->sc_tick_callout, DTSEC_TICK(sc), dtsec_if_tick, sc);
 

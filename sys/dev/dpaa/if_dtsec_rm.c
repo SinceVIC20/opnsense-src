@@ -685,6 +685,44 @@ dtsec_rm_buf_free_external(uint8_t bpid, void *buf)
 	atomic_subtract_32(&sc->sc_rx_buf_total, 1);
 }
 
+/*
+ * Called from the port's tick. The pool is otherwise refilled only when a
+ * frame reaches the CPU or as it becomes depleted; once a flood has emptied
+ * it inside the depleted state no frame can arrive, and the port stayed
+ * dead until a reboot. This refills it whatever stopped the other paths.
+ */
+void
+dtsec_rm_pool_rx_watch(struct dtsec_softc *sc)
+{
+	static volatile u_int rescued;
+	unsigned int count, headroom, nbufs, added;
+	uint32_t total;
+
+	if (sc->sc_rx_pool == NULL)
+		return;
+
+	count = bman_count(sc->sc_rx_pool);
+	total = atomic_load_32(&sc->sc_rx_buf_total);
+	if (count >= DTSEC_RM_POOL_RX_REFILL_THRESH ||
+	    total >= DTSEC_RM_POOL_RX_MAX_TOTAL)
+		return;
+
+	headroom = DTSEC_RM_POOL_RX_MAX_TOTAL - total;
+	nbufs = DTSEC_RM_POOL_RX_HIGH_MARK - count;
+	if (nbufs > headroom)
+		nbufs = headroom;
+	added = dtsec_rm_pool_rx_refill(sc, nbufs);
+	atomic_add_32(&sc->sc_rx_buf_total, added);
+
+	if (count == 0) {
+		u_int n = atomic_fetchadd_int(&rescued, 1) + 1;
+
+		if (n <= 10 || (n % 100) == 0)
+			device_printf(sc->sc_dev, "RX pool was empty, "
+			    "refilled %u buffers (%u times)\n", added, n);
+	}
+}
+
 void
 dtsec_rm_pool_rx_refill_bpid(uint8_t bpid)
 {
