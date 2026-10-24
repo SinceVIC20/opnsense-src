@@ -852,8 +852,13 @@ ExternalHashTableAddKey(void *h_HashTbl, uint8_t keySize, void *tbl_entry)
 	new_entry->hashentry.next_entry_lo =
 	    cpu_to_be32(phyaddr & 0xffffffff);
 
-	/* Update bucket head to point to new entry */
+	/*
+	 * Update bucket head to point to new entry. The barrier makes the
+	 * entry's contents visible to FMan before the store that links it
+	 * (ASK e73baea).
+	 */
 	phyaddr = XX_VirtToPhys(new_entry);
+	wmb();
 	bucket->h = SwapUint64(phyaddr);
 
 func_ret:
