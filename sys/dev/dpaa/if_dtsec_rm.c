@@ -129,9 +129,11 @@ enum dtsec_rm_pool_params {
 	/*
 	 * Frames waiting for the CPU hold pool buffers. Past this QMan drops
 	 * new ones, so a flood the CPU can't keep up with leaves the port
-	 * buffers to receive into. ASK's value (d1adb10, 0b2a8c8).
+	 * buffers to receive into (ASK d1adb10, 0b2a8c8). A quarter of the
+	 * pool's high mark: ASK's 1280 is half of a larger pool, and here it
+	 * let a flood empty the pool.
 	 */
-	DTSEC_RM_RX_CG_FRAMES		= 1280,
+	DTSEC_RM_RX_CG_FRAMES		= DTSEC_RM_POOL_RX_HIGH_MARK / 4,
 
 	DTSEC_RM_POOL_FI_LOW_MARK	= 16,
 	DTSEC_RM_POOL_FI_HIGH_MARK	= 64,
