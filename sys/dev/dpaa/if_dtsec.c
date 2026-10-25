@@ -1021,6 +1021,16 @@ dtsec_sysctl_cg_frames(SYSCTL_HANDLER_ARGS)
 }
 
 static int
+dtsec_sysctl_cg_changes(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	u_int changes;
+
+	changes = qman_cg_changes(sc->sc_rx_cg);
+	return (sysctl_handle_int(oidp, &changes, 0, req));
+}
+
+static int
 dtsec_sysctl_rx_counter(SYSCTL_HANDLER_ARGS)
 {
 	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
@@ -1611,6 +1621,10 @@ dtsec_attach(device_t dev)
 		    "rx_cg_frames", CTLTYPE_S64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    sc, 0, dtsec_sysctl_cg_frames, "Q",
 		    "Frames waiting for the CPU in the port's group (-1 = none)");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_cg_changes", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, 0, dtsec_sysctl_cg_changes, "IU",
+		    "Times the port's queues to the CPU entered or left their limit");
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "rx_frames", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    sc, e_FM_PORT_COUNTERS_FRAME, dtsec_sysctl_rx_counter, "IU",

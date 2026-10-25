@@ -298,6 +298,11 @@ void qman_cg_free(t_Handle cg);
  */
 int64_t qman_cg_count(t_Handle cg);
 
+/**
+ * Times the group entered or left its congested state, i.e. hit its limit.
+ */
+u_int qman_cg_changes(t_Handle cg);
+
 uint32_t qman_get_pfdr_in_use(void);
 uint32_t qman_get_sfdr_in_use(void);
 

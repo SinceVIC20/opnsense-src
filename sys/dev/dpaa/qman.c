@@ -677,6 +677,33 @@ qman_fqr_free(t_Handle fqr)
 	return (error);
 }
 
+/* Times each group entered or left its congested state, i.e. hit its limit. */
+#define	QMAN_CG_SLOTS	64
+static struct qman_cg_slot {
+	t_Handle	cg;
+	volatile u_int	changes;
+} qman_cg_slots[QMAN_CG_SLOTS];
+
+static void
+qman_cg_state_change(t_Handle app, e_QmExceptions exception)
+{
+	struct qman_cg_slot *slot = app;
+
+	if (exception == e_QM_EX_CG_STATE_CHANGE)
+		atomic_add_int(&slot->changes, 1);
+}
+
+static struct qman_cg_slot *
+qman_cg_slot_find(t_Handle cg)
+{
+	int i;
+
+	for (i = 0; i < QMAN_CG_SLOTS; i++)
+		if (qman_cg_slots[i].cg == cg)
+			return (&qman_cg_slots[i]);
+	return (NULL);
+}
+
 /*
  * A congestion group that refuses enqueues once its queues hold the given
  * number of frames. Groups are made and freed on CPU 0's portal.
@@ -685,11 +712,13 @@ t_Handle
 qman_cg_create(uint32_t frames)
 {
 	struct qman_softc *sc;
+	struct qman_cg_slot *slot;
 	t_QmCgParams cgp;
 	t_Handle cg, portal;
 
 	sc = qman_sc;
 	cg = NULL;
+	slot = qman_cg_slot_find(NULL);
 
 	thread_lock(curthread);
 	sched_bind(curthread, 0);
@@ -703,7 +732,15 @@ qman_cg_create(uint32_t frames)
 		cgp.frameCount = TRUE;
 		cgp.tailDropEnable = TRUE;
 		cgp.threshold = frames;
+		/* Count limit hits; without a free slot the group just isn't counted. */
+		if (slot != NULL) {
+			slot->changes = 0;
+			cgp.h_App = slot;
+			cgp.f_Exception = qman_cg_state_change;
+		}
 		cg = QM_CG_Create(&cgp);
+		if (cg != NULL && slot != NULL)
+			slot->cg = cg;
 	}
 	if (cg == NULL)
 		device_printf(sc->sc_dev,
@@ -732,6 +769,22 @@ qman_cg_free(t_Handle cg)
 	thread_lock(curthread);
 	sched_unbind(curthread);
 	thread_unlock(curthread);
+
+	{
+		struct qman_cg_slot *slot = qman_cg_slot_find(cg);
+
+		if (slot != NULL)
+			slot->cg = NULL;
+	}
+}
+
+u_int
+qman_cg_changes(t_Handle cg)
+{
+	struct qman_cg_slot *slot;
+
+	slot = (cg != NULL) ? qman_cg_slot_find(cg) : NULL;
+	return (slot != NULL ? slot->changes : 0);
 }
 
 int64_t
