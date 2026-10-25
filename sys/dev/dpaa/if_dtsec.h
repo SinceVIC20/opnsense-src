@@ -114,6 +114,8 @@ struct dtsec_softc {
 	uint32_t			sc_rx_refill_bufs;
 	uint32_t			sc_rx_alloc_fail;
 	uint32_t			sc_rx_pool_min;	/* lowest free count seen */
+	uint32_t			sc_rx_cpu_held;	/* buffers handed to the stack */
+	uint32_t			sc_rx_cpu_drops;
 
 	/* RX Frame Queues — RSS hash distribution via dedicated channels */
 	t_Handle			sc_rx_fqr[DTSEC_RX_NUM_FQS];
@@ -203,6 +205,15 @@ e_FmPortType	dtsec_fm_port_tx_type(enum eth_dev_type type);
  */
 void		dtsec_rm_buf_free_external(uint8_t bpid, void *buf);
 void		dtsec_rm_pool_rx_refill_bpid(uint8_t bpid);
+
+/*
+ * For CDX's queues to the CPU: admit a frame of the pool @bpid to the
+ * stack, or put its buffer back in the pool and return false when the
+ * port's frames already hold their share. dtsec_rm_rx_cpu_done() when
+ * the stack frees an admitted frame.
+ */
+bool		dtsec_rm_rx_cpu_admit(uint8_t bpid, void *buf);
+void		dtsec_rm_rx_cpu_done(uint8_t bpid);
 
 /*
  * The congestion group of a dtsec port's queues to the CPU, for CDX's

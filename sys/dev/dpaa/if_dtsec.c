@@ -1597,6 +1597,12 @@ dtsec_attach(device_t dev)
 		SYSCTL_ADD_U32(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "rx_alloc_fail", CTLFLAG_RD, &sc->sc_rx_alloc_fail, 0,
 		    "RX pool top-ups cut short by a failed allocation");
+		SYSCTL_ADD_U32(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_cpu_held", CTLFLAG_RD, &sc->sc_rx_cpu_held, 0,
+		    "RX buffers the stack holds now");
+		SYSCTL_ADD_U32(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_cpu_drops", CTLFLAG_RD, &sc->sc_rx_cpu_drops, 0,
+		    "Frames for the CPU put back in the pool, its share being full");
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "rx_pool_min", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    sc, 0, dtsec_sysctl_pool_min, "IU",

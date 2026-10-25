@@ -134,6 +134,14 @@ enum dtsec_rm_pool_params {
 	 * let a flood empty the pool.
 	 */
 	DTSEC_RM_RX_CG_FRAMES		= DTSEC_RM_POOL_RX_HIGH_MARK / 4,
+	/*
+	 * Frames handed to the stack keep their buffers until it frees them,
+	 * and queues past QMan (netgraph for PPPoE, sockets) never count in
+	 * the group above. Past this many, frames for the CPU go back to the
+	 * pool so offloaded traffic still has buffers: half the seed, as in
+	 * ASK 0b2a8c8.
+	 */
+	DTSEC_RM_RX_CPU_MAX		= DTSEC_RM_POOL_RX_HIGH_MARK / 2,
 
 	DTSEC_RM_POOL_FI_LOW_MARK	= 16,
 	DTSEC_RM_POOL_FI_HIGH_MARK	= 64,
@@ -769,6 +777,54 @@ dtsec_rm_pool_rx_refill_bpid(uint8_t bpid)
 		atomic_add_32(&sc->sc_rx_buf_total, added);
 	}
 }
+
+/* Put a received frame's buffer straight back in the pool, dropping it. */
+static void
+dtsec_rm_pool_rx_recycle(struct dtsec_softc *sc, void *frame_va)
+{
+	void *buf;
+
+	buf = dtsec_rm_buf_recover_ptr(frame_va);
+	if (bman_put_buffer(sc->sc_rx_pool, buf) != 0) {
+		uma_zfree(sc->sc_rx_zone, buf);
+		atomic_subtract_32(&sc->sc_rx_buf_total, 1);
+	}
+}
+
+static bool
+dtsec_rm_rx_cpu_take(struct dtsec_softc *sc, void *frame_va)
+{
+
+	if (atomic_load_32(&sc->sc_rx_cpu_held) >= DTSEC_RM_RX_CPU_MAX) {
+		dtsec_rm_pool_rx_recycle(sc, frame_va);
+		atomic_add_32(&sc->sc_rx_cpu_drops, 1);
+		if_inc_counter(sc->sc_ifnet, IFCOUNTER_IQDROPS, 1);
+		return (false);
+	}
+	atomic_add_32(&sc->sc_rx_cpu_held, 1);
+	return (true);
+}
+
+bool
+dtsec_rm_rx_cpu_admit(uint8_t bpid, void *buf)
+{
+	struct dtsec_softc *sc;
+
+	sc = dtsec_bpid_map[bpid];
+	if (__predict_false(sc == NULL))
+		return (true);
+	return (dtsec_rm_rx_cpu_take(sc, buf));
+}
+
+void
+dtsec_rm_rx_cpu_done(uint8_t bpid)
+{
+	struct dtsec_softc *sc;
+
+	sc = dtsec_bpid_map[bpid];
+	if (__predict_true(sc != NULL))
+		atomic_subtract_32(&sc->sc_rx_cpu_held, 1);
+}
 /** @} */
 
 
@@ -794,6 +850,7 @@ dtsec_rm_fqr_mext_free(struct mbuf *m)
 	 */
 	uma_zfree(sc->sc_rx_zone, dtsec_rm_buf_recover_ptr(buffer));
 	atomic_subtract_32(&sc->sc_rx_buf_total, 1);
+	atomic_subtract_32(&sc->sc_rx_cpu_held, 1);
 }
 
 static e_RxStoreResponse
@@ -867,9 +924,14 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 		}
 	}
 
+	if (!dtsec_rm_rx_cpu_take(sc, frame_va))
+		return (e_RX_STORE_RESPONSE_CONTINUE);
+
 	m = m_gethdr(M_NOWAIT, MT_HEADER);
-	if (m == NULL)
+	if (m == NULL) {
+		atomic_subtract_32(&sc->sc_rx_cpu_held, 1);
 		goto err;
+	}
 
 	m_extadd(m, frame_va, FM_PORT_BUFFER_SIZE,
 	    dtsec_rm_fqr_mext_free, frame_va, sc, 0,
