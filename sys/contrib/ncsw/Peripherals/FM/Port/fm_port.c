@@ -3421,6 +3421,7 @@ t_Error FM_PORT_SetNumOfTasks(t_Handle h_FmPort, t_FmPortRsrc *p_NumOfTasks)
 t_Error FM_PORT_SetSizeOfFifo(t_Handle h_FmPort, t_FmPortRsrc *p_SizeOfFifo)
 {
     t_FmPort *p_FmPort = (t_FmPort*)h_FmPort;
+    t_FmPortRsrc oldFifoBufs;
     t_Error err;
 
     SANITY_CHECK_RETURN_ERROR(p_FmPort, E_INVALID_HANDLE);
@@ -3450,17 +3451,25 @@ t_Error FM_PORT_SetSizeOfFifo(t_Handle h_FmPort, t_FmPortRsrc *p_SizeOfFifo)
             RETURN_ERROR(MAJOR, E_INVALID_VALUE,
                          (" No SizeOfFifo-extra for non Rx ports"));
 
+    /* Keep the old size if the new one is refused (as ASK does). */
+    oldFifoBufs = p_FmPort->fifoBufs;
     memcpy(&p_FmPort->fifoBufs, p_SizeOfFifo, sizeof(t_FmPortRsrc));
 
     /* we do not change user's parameter */
     err = VerifySizeOfFifo(p_FmPort);
     if (err)
+    {
+        p_FmPort->fifoBufs = oldFifoBufs;
         RETURN_ERROR(MAJOR, err, NO_MSG);
+    }
 
     err = FmSetSizeOfFifo(p_FmPort->h_Fm, p_FmPort->hardwarePortId,
                           &p_SizeOfFifo->num, &p_SizeOfFifo->extra, FALSE);
     if (err)
+    {
+        p_FmPort->fifoBufs = oldFifoBufs;
         RETURN_ERROR(MAJOR, err, NO_MSG);
+    }
 
     return E_OK;
 }

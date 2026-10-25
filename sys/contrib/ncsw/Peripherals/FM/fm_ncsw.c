@@ -2611,7 +2611,7 @@ t_Error FmSetSizeOfFifo(t_Handle    h_Fm,
     t_Error                 err;
     struct fman_bmi_regs    *bmi_rg = p_Fm->p_FmBmiRegs;
     uint32_t                sizeOfFifo = *p_SizeOfFifo, extraSizeOfFifo = *p_ExtraSizeOfFifo;
-    uint16_t                currentVal = 0, currentExtraVal = 0;
+    uint32_t                currentVal = 0, currentExtraVal = 0;
 
     if ((p_Fm->guestId != NCSW_MASTER_ID) &&
         !p_Fm->baseAddr &&
@@ -2657,8 +2657,10 @@ t_Error FmSetSizeOfFifo(t_Handle    h_Fm,
     {
         /* !initialConfig - runtime change of existing value.
          * - read the current FIFO and extra FIFO size */
-        currentExtraVal = fman_get_size_of_extra_fifo(bmi_rg, hardwarePortId);
-        currentVal = fman_get_size_of_fifo(bmi_rg, hardwarePortId);
+        /* The registers hold 256-byte units; the accounting is in bytes
+         * (as in ASK's FM resource rework). */
+        currentExtraVal = (uint32_t)fman_get_size_of_extra_fifo(bmi_rg, hardwarePortId) * BMI_FIFO_UNITS;
+        currentVal = (uint32_t)fman_get_size_of_fifo(bmi_rg, hardwarePortId) * BMI_FIFO_UNITS;
     }
 
     if (extraSizeOfFifo > currentExtraVal)
