@@ -116,6 +116,7 @@ struct dtsec_softc {
 	uint32_t			sc_rx_pool_min;	/* lowest free count seen */
 	uint32_t			sc_rx_cpu_held;	/* buffers handed to the stack */
 	uint32_t			sc_rx_cpu_drops;
+	uint32_t			sc_util_cmp[3];	/* TEST: FIFO bytes, tasks, DMAs */
 
 	/* RX Frame Queues — RSS hash distribution via dedicated channels */
 	t_Handle			sc_rx_fqr[DTSEC_RX_NUM_FQS];

@@ -1041,6 +1041,67 @@ dtsec_sysctl_rx_fifo(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_int(oidp, &size, 0, req));
 }
 
+/* TEST: what the utilisation counters compare against: "fifo tasks dmas". */
+static int
+dtsec_sysctl_util_cmp(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	t_FmPortPerformanceCnt cnt;
+	char buf[48];
+	u_int f, t, d;
+	int error;
+
+	snprintf(buf, sizeof(buf), "%u %u %u", sc->sc_util_cmp[0],
+	    sc->sc_util_cmp[1], sc->sc_util_cmp[2]);
+	error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+	if (error || req->newptr == NULL)
+		return (error);
+	if (sc->sc_rxph == NULL || sscanf(buf, "%u %u %u", &f, &t, &d) != 3)
+		return (EINVAL);
+
+	cnt.fifoCompVal = f;
+	cnt.taskCompVal = t;
+	cnt.dmaCompVal = d;
+	cnt.queueCompVal = 1;
+	if (FM_PORT_SetPerformanceCountersParams(sc->sc_rxph, &cnt) != E_OK)
+		return (EINVAL);
+	sc->sc_util_cmp[0] = f;
+	sc->sc_util_cmp[1] = t;
+	sc->sc_util_cmp[2] = d;
+	return (0);
+}
+
+/*
+ * TEST: share of one second the receive port spent at or above the compare
+ * values, in hundredths of a percent: "fifo tasks dmas".
+ */
+static int
+dtsec_sysctl_util(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	static const e_FmPortCounters ctr[] = { e_FM_PORT_COUNTERS_CYCLE,
+	    e_FM_PORT_COUNTERS_FIFO_UTIL, e_FM_PORT_COUNTERS_TASK_UTIL,
+	    e_FM_PORT_COUNTERS_DMA_UTIL };
+	uint64_t v[4];
+	char buf[48];
+	int i;
+
+	if (sc->sc_rxph == NULL)
+		return (ENXIO);
+	FM_PORT_SetPerformanceCounters(sc->sc_rxph, TRUE);
+	for (i = 0; i < 4; i++)
+		FM_PORT_ModifyCounter(sc->sc_rxph, ctr[i], 0);
+	pause("rxutil", hz);
+	for (i = 0; i < 4; i++)
+		v[i] = FM_PORT_GetCounter(sc->sc_rxph, ctr[i]);
+	if (v[0] == 0)
+		v[0] = 1;
+	snprintf(buf, sizeof(buf), "%ju %ju %ju",
+	    (uintmax_t)(v[1] * 10000 / v[0]), (uintmax_t)(v[2] * 10000 / v[0]),
+	    (uintmax_t)(v[3] * 10000 / v[0]));
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
 static int
 dtsec_sysctl_rx_counter(SYSCTL_HANDLER_ARGS)
 {
@@ -1640,6 +1701,14 @@ dtsec_attach(device_t dev)
 		    "rx_fifo", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    sc, 0, dtsec_sysctl_rx_fifo, "IU",
 		    "Receive port FIFO in bytes (set at boot by hint.dtsec.N.rx_fifo)");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_util_cmp", CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE,
+		    sc, 0, dtsec_sysctl_util_cmp, "A",
+		    "TEST: utilisation compare values \"fifo_bytes tasks dmas\"");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_util", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, 0, dtsec_sysctl_util, "A",
+		    "TEST: 1 s share at or above rx_util_cmp, 1/100 %: fifo tasks dmas");
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "rx_frames", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    sc, e_FM_PORT_COUNTERS_FRAME, dtsec_sysctl_rx_counter, "IU",
