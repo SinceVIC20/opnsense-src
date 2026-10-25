@@ -2675,6 +2675,27 @@ uint32_t QM_FQR_GetCounter(t_Handle h_QmFqr, t_Handle h_QmPortal, uint32_t fqidO
 }
 
 
+/* QMan reads a CGR command's 16- and 32-bit fields big-endian. The code
+ * below builds them in CPU order; put them in QMan's order just before the
+ * commit, as WRITE_UINT16/32 do for the FQ commands. */
+static void CgrCmdToHw(struct qm_mc_command *p_Mcc)
+{
+    uint16_t weMask = p_Mcc->initcgr.we_mask;
+    uint16_t thres = (uint16_t)((p_Mcc->initcgr.cgr.cs_thres.TA << 5) |
+        p_Mcc->initcgr.cgr.cs_thres.Tn);
+    uint32_t targ = p_Mcc->initcgr.cgr.cscn_targ;
+    uint32_t g = p_Mcc->initcgr.cgr.wr_parm_g.word;
+    uint32_t y = p_Mcc->initcgr.cgr.wr_parm_y.word;
+    uint32_t r = p_Mcc->initcgr.cgr.wr_parm_r.word;
+
+    WRITE_UINT16(p_Mcc->initcgr.we_mask, weMask);
+    WRITE_UINT16(*(volatile uint16_t *)&p_Mcc->initcgr.cgr.cs_thres, thres);
+    WRITE_UINT32(p_Mcc->initcgr.cgr.cscn_targ, targ);
+    WRITE_UINT32(p_Mcc->initcgr.cgr.wr_parm_g.word, g);
+    WRITE_UINT32(p_Mcc->initcgr.cgr.wr_parm_y.word, y);
+    WRITE_UINT32(p_Mcc->initcgr.cgr.wr_parm_r.word, r);
+}
+
 t_Handle QM_CG_Create(t_QmCgParams *p_CgParams)
 {
     t_QmCg                          *p_QmCg;
@@ -2852,6 +2873,7 @@ t_Handle QM_CG_Create(t_QmCgParams *p_CgParams)
         return NULL;
     }
 
+    CgrCmdToHw(p_Mcc);
     qm_mc_commit(p_QmPortal->p_LowQmPortal, QM_MCC_VERB_INITCGR);
     while (!(p_Mcr = qm_mc_result(p_QmPortal->p_LowQmPortal))) ;
     ASSERT_COND((p_Mcr->verb & QM_MCR_VERB_MASK) == QM_MCC_VERB_INITCGR);
@@ -2901,6 +2923,7 @@ t_Error QM_CG_Free(t_Handle h_QmCg)
         RETURN_ERROR(MAJOR, E_INVALID_STATE, ("QmPortalUnregisterCg failed"));
     }
 
+    CgrCmdToHw(p_Mcc);
     qm_mc_commit(p_QmPortal->p_LowQmPortal, QM_MCC_VERB_MODIFYCGR);
     while (!(p_Mcr = qm_mc_result(p_QmPortal->p_LowQmPortal))) ;
     ASSERT_COND((p_Mcr->verb & QM_MCR_VERB_MASK) == QM_MCC_VERB_MODIFYCGR);
@@ -2945,6 +2968,7 @@ t_Error QM_CG_SetException(t_Handle h_QmCg, e_QmExceptions exception, bool enabl
         RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("Illegal exception"));
     }
 
+    CgrCmdToHw(p_Mcc);
     qm_mc_commit(p_QmPortal->p_LowQmPortal, QM_MCC_VERB_MODIFYCGR);
     while (!(p_Mcr = qm_mc_result(p_QmPortal->p_LowQmPortal))) ;
     ASSERT_COND((p_Mcr->verb & QM_MCR_VERB_MASK) == QM_MCC_VERB_MODIFYCGR);
@@ -3039,6 +3063,7 @@ t_Error QM_CG_ModifyWredCurve(t_Handle h_QmCg, t_QmCgModifyWredParams *p_QmCgMod
         RETURN_ERROR(MINOR, err, NO_MSG);
     }
 
+    CgrCmdToHw(p_Mcc);
     qm_mc_commit(p_QmPortal->p_LowQmPortal, QM_MCC_VERB_MODIFYCGR);
     while (!(p_Mcr = qm_mc_result(p_QmPortal->p_LowQmPortal))) ;
     ASSERT_COND((p_Mcr->verb & QM_MCR_VERB_MASK) == QM_MCC_VERB_MODIFYCGR);
@@ -3104,6 +3129,7 @@ t_Error QM_CG_ModifyTailDropThreshold(t_Handle h_QmCg, uint32_t threshold)
     p_Mcc->initcgr.cgr.cs_thres.TA = ta;
     p_Mcc->initcgr.cgr.cs_thres.Tn = tn;
 
+    CgrCmdToHw(p_Mcc);
     qm_mc_commit(p_QmPortal->p_LowQmPortal, QM_MCC_VERB_MODIFYCGR);
     while (!(p_Mcr = qm_mc_result(p_QmPortal->p_LowQmPortal))) ;
     ASSERT_COND((p_Mcr->verb & QM_MCR_VERB_MASK) == QM_MCC_VERB_MODIFYCGR);
