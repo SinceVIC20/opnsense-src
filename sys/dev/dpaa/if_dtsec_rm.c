@@ -218,7 +218,11 @@ dtsec_rm_fm_port_rx_init(struct dtsec_softc *sc, int unit)
 	t_FmPortRxParams *rx_params;
 	t_FmExtPools *pool_params;
 	t_Error error;
+	bool fifo_hint, fifo_custom;
 
+	fifo_hint = true;
+again:
+	fifo_custom = false;
 	memset(&params, 0, sizeof(params));
 
 	params.baseAddr = sc->sc_fm_base + sc->sc_port_rx_hw_id;
@@ -284,12 +288,21 @@ dtsec_rm_fm_port_rx_init(struct dtsec_softc *sc, int unit)
 
 	/*
 	 * The default 24 KB FIFO overflows on a 10G line-rate burst while
-	 * FMan classifies it, dropping frames as physical errors. 48 KB
-	 * loses none (ASK a54cfb9) and fits FMan's total FIFO.
+	 * FMan classifies it, dropping frames as physical errors. ASK's 48 KB
+	 * (a54cfb9) still lost a few in and out of one port at line rate
+	 * (ASK A399); 72 KB lost none and both 10G ports fit FMan's FIFO.
 	 */
 	if (params.portType == e_FM_PORT_TYPE_RX_10G) {
-		t_FmPortRsrc fifo = { .num = 0xc000, .extra = 0 };
+		t_FmPortRsrc fifo = { .num = 0x12000, .extra = 0 };
+		int size;
 
+		/* hint.dtsec.N.rx_fifo sets another size, in 256-byte steps. */
+		if (fifo_hint && resource_int_value("dtsec",
+		    device_get_unit(sc->sc_dev), "rx_fifo", &size) == 0 &&
+		    size > 0 && size % 256 == 0) {
+			fifo.num = size;
+			fifo_custom = true;
+		}
 		if (FM_PORT_ConfigSizeOfFifo(sc->sc_rxph, &fifo) != E_OK)
 			device_printf(sc->sc_dev,
 			    "couldn't enlarge the RX FIFO, using the default\n");
@@ -297,9 +310,16 @@ dtsec_rm_fm_port_rx_init(struct dtsec_softc *sc, int unit)
 
 	error = FM_PORT_Init(sc->sc_rxph);
 	if (error != E_OK) {
-		device_printf(sc->sc_dev, "couldn't initialize FM Port RX.\n");
 		FM_PORT_Free(sc->sc_rxph);
 		sc->sc_rxph = NULL;
+		/* A hinted FIFO that doesn't fit must not cost the port. */
+		if (fifo_custom) {
+			device_printf(sc->sc_dev, "RX FIFO hint refused, "
+			    "using the default\n");
+			fifo_hint = false;
+			goto again;
+		}
+		device_printf(sc->sc_dev, "couldn't initialize FM Port RX.\n");
 		return (ENXIO);
 	}
 

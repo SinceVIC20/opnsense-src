@@ -1030,6 +1030,17 @@ dtsec_sysctl_cg_changes(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_int(oidp, &changes, 0, req));
 }
 
+/* The receive port's FIFO in bytes, as set at boot (hint.dtsec.N.rx_fifo). */
+static int
+dtsec_sysctl_rx_fifo(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	uint32_t size;
+
+	size = (sc->sc_rxph != NULL) ? FM_PORT_GetSizeOfFifo(sc->sc_rxph) : 0;
+	return (sysctl_handle_int(oidp, &size, 0, req));
+}
+
 static int
 dtsec_sysctl_rx_counter(SYSCTL_HANDLER_ARGS)
 {
@@ -1625,6 +1636,10 @@ dtsec_attach(device_t dev)
 		    "rx_cg_changes", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    sc, 0, dtsec_sysctl_cg_changes, "IU",
 		    "Times the port's queues to the CPU entered or left their limit");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_fifo", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, 0, dtsec_sysctl_rx_fifo, "IU",
+		    "Receive port FIFO in bytes (set at boot by hint.dtsec.N.rx_fifo)");
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "rx_frames", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    sc, e_FM_PORT_COUNTERS_FRAME, dtsec_sysctl_rx_counter, "IU",
