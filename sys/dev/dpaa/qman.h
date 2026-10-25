@@ -293,6 +293,11 @@ t_Handle qman_cg_create(uint32_t frames);
  */
 void qman_cg_free(t_Handle cg);
 
+/**
+ * Frames a group from qman_cg_create() holds right now, or -1 on failure.
+ */
+int64_t qman_cg_count(t_Handle cg);
+
 uint32_t qman_get_pfdr_in_use(void);
 uint32_t qman_get_sfdr_in_use(void);
 

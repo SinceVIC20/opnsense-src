@@ -109,6 +109,11 @@ struct dtsec_softc {
 	uma_zone_t			sc_rx_zone;
 	char				sc_rx_zname[64];
 	uint32_t			sc_rx_buf_total; /* total buffers alloc'd from UMA */
+	/* Pool diagnostics, read through the rx_pool_* sysctls. */
+	uint32_t			sc_rx_refill_runs;
+	uint32_t			sc_rx_refill_bufs;
+	uint32_t			sc_rx_alloc_fail;
+	uint32_t			sc_rx_pool_min;	/* lowest free count seen */
 
 	/* RX Frame Queues — RSS hash distribution via dedicated channels */
 	t_Handle			sc_rx_fqr[DTSEC_RX_NUM_FQS];

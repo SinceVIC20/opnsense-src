@@ -1317,6 +1317,21 @@ t_Error QM_CG_ModifyWredCurve(t_Handle h_QmCg, t_QmCgModifyWredParams *p_QmCgMod
 *//***************************************************************************/
 t_Error QM_CG_ModifyTailDropThreshold(t_Handle h_QmCg, uint32_t threshold);
 
+/**************************************************************************//**
+ @Function      QM_CG_GetInstantCount
+
+ @Description   Read what the group's queues hold right now: frames for a
+                group in frame mode, bytes otherwise.
+
+ @Param[in]     h_QmCg              - A handle to a QM-CG Module.
+ @Param[out]    p_Count             - The count.
+
+ @Return        E_OK on success; Error code otherwise.
+
+ @Cautions      Allowed only following QM_Init() and QM_CG_Create() for this CG.
+*//***************************************************************************/
+t_Error QM_CG_GetInstantCount(t_Handle h_QmCg, uint64_t *p_Count);
+
 
 /** @} */ /* end of QM_cg_runtime_control_grp group */
 /** @} */ /* end of QM_cg_grp group */

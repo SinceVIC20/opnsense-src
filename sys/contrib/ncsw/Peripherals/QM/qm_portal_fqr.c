@@ -3117,3 +3117,38 @@ t_Error QM_CG_ModifyTailDropThreshold(t_Handle h_QmCg, uint32_t threshold)
     return E_OK;
 }
 
+t_Error QM_CG_GetInstantCount(t_Handle h_QmCg, uint64_t *p_Count)
+{
+    t_QmCg                  *p_QmCg = (t_QmCg *)h_QmCg;
+    struct qm_mc_command    *p_Mcc;
+    struct qm_mc_result     *p_Mcr;
+    t_QmPortal              *p_QmPortal;
+    volatile uint8_t        *p_Lo;
+
+    SANITY_CHECK_RETURN_ERROR(p_QmCg, E_INVALID_HANDLE);
+    SANITY_CHECK_RETURN_ERROR(p_Count, E_NULL_POINTER);
+
+    p_QmPortal = (t_QmPortal *)p_QmCg->h_QmPortal;
+
+    NCSW_PLOCK(p_QmPortal);
+    p_Mcc = qm_mc_start(p_QmPortal->p_LowQmPortal);
+    p_Mcc->initcgr.cgid = p_QmCg->id;
+
+    qm_mc_commit(p_QmPortal->p_LowQmPortal, QM_MCC_VERB_QUERYCGR);
+    while (!(p_Mcr = qm_mc_result(p_QmPortal->p_LowQmPortal))) ;
+    ASSERT_COND((p_Mcr->verb & QM_MCR_VERB_MASK) == QM_MCC_VERB_QUERYCGR);
+    if (p_Mcr->result != QM_MCR_RESULT_OK)
+    {
+        PUNLOCK(p_QmPortal);
+        RETURN_ERROR(MINOR, E_INVALID_STATE, ("QM_MCC_VERB_QUERYCGR failed: %s", mcr_result_str(p_Mcr->result)));
+    }
+
+    /* 40-bit big-endian count: the high byte sits just before the low word. */
+    p_Lo = (volatile uint8_t *)&p_Mcr->querycgr.i_bcnt_lo;
+    *p_Count = ((uint64_t)p_Lo[-1] << 32) | ((uint32_t)p_Lo[0] << 24) |
+        ((uint32_t)p_Lo[1] << 16) | ((uint32_t)p_Lo[2] << 8) | p_Lo[3];
+    PUNLOCK(p_QmPortal);
+
+    return E_OK;
+}
+

@@ -734,6 +734,29 @@ qman_cg_free(t_Handle cg)
 	thread_unlock(curthread);
 }
 
+int64_t
+qman_cg_count(t_Handle cg)
+{
+	uint64_t count;
+	t_Error error;
+
+	if (cg == NULL)
+		return (-1);
+
+	/* Queried on CPU 0's portal, which made the group. */
+	thread_lock(curthread);
+	sched_bind(curthread, 0);
+	thread_unlock(curthread);
+
+	error = QM_CG_GetInstantCount(cg, &count);
+
+	thread_lock(curthread);
+	sched_unbind(curthread);
+	thread_unlock(curthread);
+
+	return (error == E_OK ? (int64_t)count : -1);
+}
+
 t_Error
 qman_fqr_register_cb(t_Handle fqr, t_QmReceivedFrameCallback *callback,
     t_Handle app)

@@ -997,6 +997,40 @@ dtsec_sysctl_bman_free(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_int(oidp, &count, 0, req));
 }
 
+/* Lowest free count since the last read; reading starts a new window. */
+static int
+dtsec_sysctl_pool_min(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	uint32_t min;
+
+	min = sc->sc_rx_pool_min;
+	if (sc->sc_rx_pool != NULL)
+		sc->sc_rx_pool_min = bman_count(sc->sc_rx_pool);
+	return (sysctl_handle_int(oidp, &min, 0, req));
+}
+
+static int
+dtsec_sysctl_cg_frames(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	int64_t count;
+
+	count = qman_cg_count(sc->sc_rx_cg);
+	return (sysctl_handle_64(oidp, &count, 0, req));
+}
+
+static int
+dtsec_sysctl_rx_counter(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	uint32_t count;
+
+	count = (sc->sc_rxph != NULL) ?
+	    FM_PORT_GetCounter(sc->sc_rxph, (e_FmPortCounters)arg2) : 0;
+	return (sysctl_handle_int(oidp, &count, 0, req));
+}
+
 #if (DPAA_VERSION >= 11)
 /* The MAC's own PCS for SGMII and 1000BASE-X (memac.h is not public). */
 t_Error	MEMAC_MII_ReadPhyReg(t_Handle, uint8_t, uint8_t, uint16_t *);
@@ -1551,6 +1585,35 @@ dtsec_attach(device_t dev)
 		    "diag", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 		    sc, 0, dtsec_sysctl_diag, "I",
 		    "Write 1 to dump DQRR + BMan state to dmesg");
+		SYSCTL_ADD_U32(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_buf_total", CTLFLAG_RD, &sc->sc_rx_buf_total, 0,
+		    "RX buffers taken from memory, in the pool or in use");
+		SYSCTL_ADD_U32(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_refill_runs", CTLFLAG_RD, &sc->sc_rx_refill_runs, 0,
+		    "Times the RX pool was topped up");
+		SYSCTL_ADD_U32(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_refill_bufs", CTLFLAG_RD, &sc->sc_rx_refill_bufs, 0,
+		    "Buffers added to the RX pool by top-ups");
+		SYSCTL_ADD_U32(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_alloc_fail", CTLFLAG_RD, &sc->sc_rx_alloc_fail, 0,
+		    "RX pool top-ups cut short by a failed allocation");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_pool_min", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, 0, dtsec_sysctl_pool_min, "IU",
+		    "Lowest RX pool free count since the last read");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_cg_frames", CTLTYPE_S64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, 0, dtsec_sysctl_cg_frames, "Q",
+		    "Frames waiting for the CPU in the port's group (-1 = none)");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_frames", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, e_FM_PORT_COUNTERS_FRAME, dtsec_sysctl_rx_counter, "IU",
+		    "Frames the FMan RX port received");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "rx_oobd", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, e_FM_PORT_COUNTERS_RX_OUT_OF_BUFFERS_DISCARD,
+		    dtsec_sysctl_rx_counter, "IU",
+		    "Frames dropped because the RX pool was empty");
 #if (DPAA_VERSION >= 11)
 		if (sc->sc_mac_enet_mode & ENET_IF_SGMII_BASEX)
 			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
