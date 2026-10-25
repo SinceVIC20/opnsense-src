@@ -715,14 +715,14 @@ static uint32_t LoopMessageRing(t_QmPortal *p_QmPortal, uint32_t is)
            previous state of cg's */
         for (i = 0; i < QM_MAX_NUM_OF_CGS/32; i++)
         {
-            /* get curent state */
-            tmp.q.__state[i] = p_Mcr->querycongestion.state.__state[i];
+            /* get curent state (big-endian words, like the other MC fields) */
+            tmp.q.__state[i] = GET_UINT32(p_Mcr->querycongestion.state.__state[i]);
             /* keep only cg's that are registered for this portal */
             tmp.q.__state[i] &= p_QmPortal->cgrs[0].q.__state[i];
             /* handle only cg's that changed their state from previous exception */
             tmp.q.__state[i] ^= p_QmPortal->cgrs[1].q.__state[i];
             /* update previous */
-            p_QmPortal->cgrs[1].q.__state[i] = p_Mcr->querycongestion.state.__state[i];
+            p_QmPortal->cgrs[1].q.__state[i] = GET_UINT32(p_Mcr->querycongestion.state.__state[i]);
         }
         PUNLOCK(p_QmPortal);
 
