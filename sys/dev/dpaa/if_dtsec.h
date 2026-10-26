@@ -113,7 +113,6 @@ struct dtsec_softc {
 	uint32_t			sc_rx_refill_runs;
 	uint32_t			sc_rx_refill_bufs;
 	uint32_t			sc_rx_alloc_fail;
-	uint32_t			sc_rx_pool_min;	/* lowest free count seen */
 	uint32_t			sc_rx_cpu_held;	/* buffers handed to the stack */
 	uint32_t			sc_rx_cpu_drops;
 

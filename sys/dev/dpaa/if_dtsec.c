@@ -997,19 +997,6 @@ dtsec_sysctl_bman_free(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_int(oidp, &count, 0, req));
 }
 
-/* Lowest free count since the last read; reading starts a new window. */
-static int
-dtsec_sysctl_pool_min(SYSCTL_HANDLER_ARGS)
-{
-	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
-	uint32_t min;
-
-	min = sc->sc_rx_pool_min;
-	if (sc->sc_rx_pool != NULL)
-		sc->sc_rx_pool_min = bman_count(sc->sc_rx_pool);
-	return (sysctl_handle_int(oidp, &min, 0, req));
-}
-
 static int
 dtsec_sysctl_cg_frames(SYSCTL_HANDLER_ARGS)
 {
@@ -1018,16 +1005,6 @@ dtsec_sysctl_cg_frames(SYSCTL_HANDLER_ARGS)
 
 	count = qman_cg_count(sc->sc_rx_cg);
 	return (sysctl_handle_64(oidp, &count, 0, req));
-}
-
-static int
-dtsec_sysctl_cg_changes(SYSCTL_HANDLER_ARGS)
-{
-	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
-	u_int changes;
-
-	changes = qman_cg_changes(sc->sc_rx_cg);
-	return (sysctl_handle_int(oidp, &changes, 0, req));
 }
 
 /* The receive port's FIFO in bytes, as set at boot (hint.dtsec.N.rx_fifo). */
@@ -1625,17 +1602,9 @@ dtsec_attach(device_t dev)
 		    "rx_cpu_drops", CTLFLAG_RD, &sc->sc_rx_cpu_drops, 0,
 		    "Frames for the CPU put back in the pool, its share being full");
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
-		    "rx_pool_min", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
-		    sc, 0, dtsec_sysctl_pool_min, "IU",
-		    "Lowest RX pool free count since the last read");
-		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "rx_cg_frames", CTLTYPE_S64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    sc, 0, dtsec_sysctl_cg_frames, "Q",
 		    "Frames waiting for the CPU in the port's group (-1 = none)");
-		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
-		    "rx_cg_changes", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
-		    sc, 0, dtsec_sysctl_cg_changes, "IU",
-		    "Times the port's queues to the CPU entered or left their limit");
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "rx_fifo", CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    sc, 0, dtsec_sysctl_rx_fifo, "IU",

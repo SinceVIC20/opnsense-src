@@ -604,18 +604,6 @@ dtsec_rm_pool_rx_get_buffer(t_Handle h_BufferPool, t_Handle *context)
 	return (buffer);
 }
 
-/* Free buffers in the pool, keeping the lowest count seen for the sysctl. */
-static inline unsigned int
-dtsec_rm_pool_rx_count(struct dtsec_softc *sc)
-{
-	unsigned int count;
-
-	count = bman_count(sc->sc_rx_pool);
-	if (count < sc->sc_rx_pool_min)
-		sc->sc_rx_pool_min = count;
-	return (count);
-}
-
 /*
  * Refill the BMan buffer pool directly from UMA, bypassing
  * BM_POOL_FillBufs.  This avoids the NCSW RETURN_ERROR printf
@@ -718,7 +706,6 @@ dtsec_rm_pool_rx_init(struct dtsec_softc *sc)
 	}
 
 	sc->sc_rx_buf_total = DTSEC_RM_POOL_RX_MAX_SIZE;
-	sc->sc_rx_pool_min = DTSEC_RM_POOL_RX_MAX_SIZE;
 
 	/* Register BPID→softc mapping for external buffer release */
 	dtsec_bpid_map[sc->sc_rx_bpid] = sc;
@@ -791,7 +778,7 @@ dtsec_rm_pool_rx_refill_bpid(uint8_t bpid)
 	if (__predict_false(sc == NULL))
 		return;
 
-	if (__predict_false(dtsec_rm_pool_rx_count(sc) <
+	if (__predict_false(bman_count(sc->sc_rx_pool) <
 	    DTSEC_RM_POOL_RX_REFILL_THRESH) &&
 	    atomic_load_32(&sc->sc_rx_buf_total) <
 	    DTSEC_RM_POOL_RX_MAX_TOTAL) {
@@ -898,7 +885,7 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 	 * held by the TCP stack, FMan drops every subsequent frame, and
 	 * retransmissions are also dropped — permanent deadlock.
 	 */
-	if (__predict_false(dtsec_rm_pool_rx_count(sc) <
+	if (__predict_false(bman_count(sc->sc_rx_pool) <
 	    DTSEC_RM_POOL_RX_REFILL_THRESH) &&
 	    atomic_load_32(&sc->sc_rx_buf_total) <
 	    DTSEC_RM_POOL_RX_MAX_TOTAL) {
