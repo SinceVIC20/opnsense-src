@@ -691,8 +691,14 @@ dtsec_rm_pool_rx_init(struct dtsec_softc *sc)
 	snprintf(sc->sc_rx_zname, sizeof(sc->sc_rx_zname), "%s: RX Buffers",
 	    device_get_nameunit(sc->sc_dev));
 
+	/*
+	 * FMan writes a received frame linearly from the buffer's physical
+	 * address, and a buffer spans 3 pages, so its pages must be
+	 * physically contiguous: without UMA_ZONE_CONTIG, page_alloc gives no
+	 * such promise and a frame crossing a page could land in another page.
+	 */
 	sc->sc_rx_zone = uma_zcreate(sc->sc_rx_zname, FM_PORT_BUFFER_SIZE, NULL,
-	    NULL, NULL, NULL, 255 /* 256-byte align for DMA */, 0);
+	    NULL, NULL, NULL, 255 /* 256-byte align for DMA */, UMA_ZONE_CONTIG);
 
 	sc->sc_rx_pool = bman_pool_create(&sc->sc_rx_bpid, FM_PORT_BUFFER_SIZE,
 	    0, 0, DTSEC_RM_POOL_RX_MAX_SIZE, dtsec_rm_pool_rx_get_buffer,
