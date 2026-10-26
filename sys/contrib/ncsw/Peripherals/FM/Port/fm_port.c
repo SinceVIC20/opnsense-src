@@ -2583,6 +2583,9 @@ t_Error FM_PORT_Init(t_Handle h_FmPort)
 
     SANITY_CHECK_RETURN_ERROR(h_FmPort, E_INVALID_HANDLE);
     SANITY_CHECK_RETURN_ERROR(p_FmPort->p_FmPortDriverParam, E_INVALID_HANDLE);
+    if (p_FmPort->fmPortParamsAllocated)
+        RETURN_ERROR(MAJOR, E_INVALID_STATE,
+                     ("Port resources already allocated; free the failed port before retrying."));
 
     errCode = FmSpBuildBufferStructure(
             &p_FmPort->p_FmPortDriverParam->intContext,
@@ -2699,6 +2702,12 @@ t_Error FM_PORT_Init(t_Handle h_FmPort)
     if (errCode)
         RETURN_ERROR(MAJOR, errCode, NO_MSG);
 
+    /* Keep the charged depth, including the revision override, after the
+     * initialization parameters are freed or low-level initialization fails
+     * (from ASK 010-ask-fman-dpaa-ehash). */
+    p_FmPort->deqPipelineDepth = fmParams.deqPipelineDepth;
+    p_FmPort->fmPortParamsAllocated = TRUE;
+
     /* get params for use in init */
     p_FmPort->fmMuramPhysBaseAddr =
             (uint64_t)((uint64_t)(fmParams.fmMuramPhysBaseAddr.low)
@@ -2787,13 +2796,19 @@ t_Error FM_PORT_Free(t_Handle h_FmPort)
 
     FmPortDriverParamFree(p_FmPort);
 
-    memset(&fmParams, 0, sizeof(fmParams));
-    fmParams.hardwarePortId = p_FmPort->hardwarePortId;
-    fmParams.portType = (e_FmPortType)p_FmPort->portType;
-    fmParams.deqPipelineDepth =
-            p_FmPort->p_FmPortDriverParam->dfltCfg.tx_fifo_deq_pipeline_depth;
+    /* The driver parameters are gone (NULL) by now, so the depth comes from
+     * the port; a port whose FM_PORT_Init failed before charging anything
+     * has nothing to give back. */
+    if (p_FmPort->fmPortParamsAllocated)
+    {
+        memset(&fmParams, 0, sizeof(fmParams));
+        fmParams.hardwarePortId = p_FmPort->hardwarePortId;
+        fmParams.portType = (e_FmPortType)p_FmPort->portType;
+        fmParams.deqPipelineDepth = p_FmPort->deqPipelineDepth;
 
-    FmFreePortParams(p_FmPort->h_Fm, &fmParams);
+        FmFreePortParams(p_FmPort->h_Fm, &fmParams);
+        p_FmPort->fmPortParamsAllocated = FALSE;
+    }
 
 #if (DPAA_VERSION >= 11)
     if (FmVSPFreeForPort(p_FmPort->h_Fm, p_FmPort->portType, p_FmPort->portId)

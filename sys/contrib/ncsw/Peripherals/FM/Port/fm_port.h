@@ -886,6 +886,8 @@ typedef struct {
     int                         enabled;
     char                        name[MODULE_NAME_SIZE];
     uint8_t                     hardwarePortId;
+    uint8_t                     deqPipelineDepth;       /* charged at init, for FM_PORT_Free */
+    bool                        fmPortParamsAllocated;  /* FmGetSetPortParams succeeded */
     uint16_t                    fmClkFreq;
     t_FmPortQmiRegs             *p_FmPortQmiRegs;
     u_FmPortBmiRegs             *p_FmPortBmiRegs;
