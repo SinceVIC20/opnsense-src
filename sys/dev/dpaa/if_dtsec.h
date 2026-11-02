@@ -110,9 +110,10 @@ struct dtsec_softc {
 	struct mtx			sc_mac_stats_lock;
 	struct callout			sc_mac_stats_callout;
 	bool				sc_mac_stats_valid;
-	uint32_t			sc_mac_last[7];
-	uint64_t			sc_mac_total[7];
+	uint32_t			sc_mac_last[8];
+	uint64_t			sc_mac_total[8];
 	uint64_t			sc_mac_obytes_raw;	/* last raw read */
+	uint64_t			sc_mac_obytes_shown;	/* never less than this */
 
 	/*
 	 * 1000BASE-X autonegotiation: 0 off, 1 on, 2 auto (negotiate, else a

@@ -1489,14 +1489,14 @@ dtsec_sysctl_sfp_phy_modes(SYSCTL_HANDLER_ARGS)
 
 /* Slots in sc_mac_last/sc_mac_total, in dtsec_mac_stats_update() order. */
 enum { MAC_IPKTS, MAC_OPKTS, MAC_IBYTES, MAC_OBYTES, MAC_IERRS, MAC_OERRS,
-	MAC_IMCASTS };
+	MAC_IMCASTS, MAC_OPAUSE };
 
 /* Add what each MAC counter moved since the last read, low 32 bits only. */
 static void
 dtsec_mac_stats_update(struct dtsec_softc *sc)
 {
 	t_FmMacStatistics ms;
-	uint64_t raw[7];
+	uint64_t raw[8];
 	uint32_t cur;
 	int i;
 
@@ -1511,8 +1511,9 @@ dtsec_mac_stats_update(struct dtsec_softc *sc)
 	raw[MAC_IERRS] = ms.ifInErrors;
 	raw[MAC_OERRS] = ms.ifOutErrors;
 	raw[MAC_IMCASTS] = ms.ifInMcastPkts;
+	raw[MAC_OPAUSE] = ms.teStatPause;	/* PAUSE frames sent (TXPF) */
 	sc->sc_mac_obytes_raw = ms.ifOutOctets;
-	for (i = 0; i < 7; i++) {
+	for (i = 0; i < 8; i++) {
 		cur = (uint32_t)raw[i];
 		if (sc->sc_mac_stats_valid)
 			sc->sc_mac_total[i] += (uint32_t)(cur - sc->sc_mac_last[i]);
@@ -1558,6 +1559,16 @@ dtsec_get_counter(if_t ifp, ift_counter cnt)
 		return (if_get_counter_default(ifp, cnt));
 	}
 	v = sc->sc_mac_total[slot];
+	if (slot == MAC_OBYTES) {
+		/*
+		 * The MAC counts the 64-byte PAUSE frames it sends as sent
+		 * bytes (not as sent packets). TXPF and TOCT are read apart,
+		 * so never report less than before.
+		 */
+		v -= MIN(v, 64 * sc->sc_mac_total[MAC_OPAUSE]);
+		v = MAX(v, sc->sc_mac_obytes_shown);
+		sc->sc_mac_obytes_shown = v;
+	}
 	mtx_unlock(&sc->sc_mac_stats_lock);
 	return (v);
 }
@@ -1791,6 +1802,9 @@ dtsec_attach(device_t dev)
 		SYSCTL_ADD_U64(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "mac_obytes_raw", CTLFLAG_RD, &sc->sc_mac_obytes_raw, 0,
 		    "Bytes sent as the MAC's own 64-bit counter reads");
+		SYSCTL_ADD_U64(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "pause_sent", CTLFLAG_RD, &sc->sc_mac_total[MAC_OPAUSE], 0,
+		    "PAUSE frames the MAC sent (flow control)");
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "cpu_ibytes", CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    sc, IFCOUNTER_IBYTES, dtsec_sysctl_cpu_counter, "QU",
