@@ -1158,6 +1158,27 @@ mmcsd_errmsg(int e)
 	return (errmsg[e]);
 }
 
+/* A failed transfer is tried this many more times before the I/O fails. */
+#define	MMCSD_RW_RETRIES	3
+
+/*
+ * Get the card ready again after a failed transfer, as Linux's mmc_blk
+ * recovery does: stop a transfer it may still be in (a card that is not
+ * in one refuses this, which is fine), then wait until it has finished
+ * programming and is back in the transfer state.
+ */
+static void
+mmcsd_rw_recover(struct mmcsd_softc *sc)
+{
+	struct mmc_command stop;
+
+	memset(&stop, 0, sizeof(stop));
+	stop.opcode = MMC_STOP_TRANSMISSION;
+	stop.flags = MMC_RSP_R1B | MMC_CMD_AC;
+	(void)mmc_wait_for_cmd(sc->mmcbus, sc->dev, &stop, 0);
+	(void)mmc_switch_status(sc->mmcbus, sc->dev, sc->rca, 2000000);
+}
+
 static daddr_t
 mmcsd_rw(struct mmcsd_part *part, struct bio *bp)
 {
@@ -1170,11 +1191,13 @@ mmcsd_rw(struct mmcsd_part *part, struct bio *bp)
 	device_t dev, mmcbus;
 	u_int numblocks, sz;
 	char *vaddr;
+	int tries;
 
 	sc = part->sc;
 	dev = sc->dev;
 	mmcbus = sc->mmcbus;
 
+	tries = 0;
 	block = bp->bio_pblkno;
 	sz = part->disk->d_sectorsize;
 	end = bp->bio_pblkno + (bp->bio_bcount / sz);
@@ -1226,7 +1249,17 @@ mmcsd_rw(struct mmcsd_part *part, struct bio *bp)
 				device_printf(dev, "Error indicated: %d %s\n",
 				    req.cmd->error,
 				    mmcsd_errmsg(req.cmd->error));
-			break;
+			/* One slow write must not fail the I/O: UFS panics on a failed root write. */
+			if (tries++ == MMCSD_RW_RETRIES)
+				break;
+			mmcsd_rw_recover(sc);
+			continue;
+		}
+		if (tries != 0) {
+			device_printf(dev, "%s of block %jd done after %d %s\n",
+			    bp->bio_cmd == BIO_READ ? "Read" : "Write",
+			    (intmax_t)block, tries, tries == 1 ? "retry" : "retries");
+			tries = 0;
 		}
 		block += numblocks;
 	}
