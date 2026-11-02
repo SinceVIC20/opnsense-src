@@ -1322,6 +1322,18 @@ dtsec_sysctl_sfp_eeprom(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_string(oidp, hex, sizeof(hex), req));
 }
 
+/* What passed through the CPU: the driver's own counts, which the MAC's
+ * counters (and so the interface's) hide. */
+static int
+dtsec_sysctl_cpu_counter(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	uint64_t value;
+
+	value = if_get_counter_default(sc->sc_ifnet, (ift_counter)arg2);
+	return (sysctl_handle_64(oidp, &value, 0, req));
+}
+
 static int
 dtsec_sysctl_sfp_info(SYSCTL_HANDLER_ARGS)
 {
@@ -1618,6 +1630,22 @@ dtsec_attach(device_t dev)
 		    sc, e_FM_PORT_COUNTERS_RX_OUT_OF_BUFFERS_DISCARD,
 		    dtsec_sysctl_rx_counter, "IU",
 		    "Frames dropped because the RX pool was empty");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "cpu_ibytes", CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, IFCOUNTER_IBYTES, dtsec_sysctl_cpu_counter, "QU",
+		    "Bytes received for the CPU, not offloaded");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "cpu_obytes", CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, IFCOUNTER_OBYTES, dtsec_sysctl_cpu_counter, "QU",
+		    "Bytes the CPU sent, not offloaded");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "cpu_ipackets", CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, IFCOUNTER_IPACKETS, dtsec_sysctl_cpu_counter, "QU",
+		    "Frames received for the CPU, not offloaded");
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "cpu_opackets", CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, IFCOUNTER_OPACKETS, dtsec_sysctl_cpu_counter, "QU",
+		    "Frames the CPU sent, not offloaded");
 #if (DPAA_VERSION >= 11)
 		if (sc->sc_mac_enet_mode & ENET_IF_SGMII_BASEX)
 			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
