@@ -1946,6 +1946,28 @@ t_Error FmSetNumOfRiscsPerPort(t_Handle     h_Fm,
     return E_OK;
 }
 
+/*
+ * A port refused part way through setup gives back what FmGetSetPortParams
+ * already counted for it, or a retry with smaller values (and any later port)
+ * finds the tasks or FIFO of a port that never started still taken.
+ */
+static void UndoPortParams(t_Fm *p_Fm, t_FmInterModulePortInitParams *p_PortParams,
+                           uint8_t hardwarePortId, bool fifoTaken)
+{
+    p_Fm->p_FmStateStruct->accumulatedNumOfTasks -= p_PortParams->numOfTasks;
+    if (fifoTaken)
+        p_Fm->p_FmStateStruct->accumulatedFifoSize -= p_PortParams->sizeOfFifo;
+#ifdef FM_QMI_NO_DEQ_OPTIONS_SUPPORT
+    if (p_Fm->p_FmStateStruct->revInfo.majorRev != 4)
+#endif /* FM_QMI_NO_DEQ_OPTIONS_SUPPORT */
+    if ((p_PortParams->portType != e_FM_PORT_TYPE_RX) &&
+        (p_PortParams->portType != e_FM_PORT_TYPE_RX_10G))
+        p_Fm->p_FmStateStruct->accumulatedNumOfDeqTnums -= p_PortParams->deqPipelineDepth;
+    if (p_PortParams->portType == e_FM_PORT_TYPE_OH_HOST_COMMAND)
+        p_Fm->hcPortInitialized = FALSE;
+    p_Fm->p_FmStateStruct->portsTypes[hardwarePortId] = e_FM_PORT_TYPE_DUMMY;
+}
+
 t_Error FmGetSetPortParams(t_Handle h_Fm, t_FmInterModulePortInitParams *p_PortParams)
 {
     t_Fm                    *p_Fm = (t_Fm*)h_Fm;
@@ -2090,6 +2112,7 @@ t_Error FmGetSetPortParams(t_Handle h_Fm, t_FmInterModulePortInitParams *p_PortP
                           TRUE);
     if (err)
     {
+        UndoPortParams(p_Fm, p_PortParams, hardwarePortId, FALSE);
         XX_UnlockIntrSpinlock(p_Fm->h_Spinlock, intFlags);
         RETURN_ERROR(MAJOR, err, NO_MSG);
     }
@@ -2101,6 +2124,7 @@ t_Error FmGetSetPortParams(t_Handle h_Fm, t_FmInterModulePortInitParams *p_PortP
                              TRUE);
     if (err)
     {
+        UndoPortParams(p_Fm, p_PortParams, hardwarePortId, TRUE);
         XX_UnlockIntrSpinlock(p_Fm->h_Spinlock, intFlags);
         RETURN_ERROR(MAJOR, err, NO_MSG);
     }
