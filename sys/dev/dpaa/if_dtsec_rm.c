@@ -1014,8 +1014,8 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 		}
 	}
 
+	/* ether_input() counts the bytes. */
 	if_inc_counter(sc->sc_ifnet, IFCOUNTER_IPACKETS, 1);
-	if_inc_counter(sc->sc_ifnet, IFCOUNTER_IBYTES, m->m_pkthdr.len);
 #ifdef __aarch64__
 	qman_rx_defer(m);
 #else
