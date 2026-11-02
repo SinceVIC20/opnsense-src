@@ -1457,71 +1457,25 @@ fmcd_pcd_close(struct cdev *dev, int flags, int fmt, struct thread *td)
 		}
 	} else {
 		/*
-		 * No CDX takeover — dpa_app exited before CDX claimed
-		 * the PCD resources.  Delete all NCSW objects in
-		 * dependency order to prevent kernel memory leaks.
+		 * No CDX takeover: dpa_app gave up before CDX claimed the
+		 * PCD resources. Leave the objects in place and forget the
+		 * handles, as after a takeover: deleting a tree that uses
+		 * CDX's external hash tables panics inside NCSW, and a port
+		 * that failed to start left the router restarting for good.
+		 * They stay until the next boot; offload isn't running then.
 		 */
-		static const enum fmcd_handle_type teardown_order[] = {
-			FMCD_HDL_FRM_REPLIC,
-			FMCD_HDL_PLCR_PROFILE,
-			FMCD_HDL_MATCH_TABLE,
-			FMCD_HDL_HASH_TABLE,
-			FMCD_HDL_CC_ROOT,
-			FMCD_HDL_KG_SCHEME,
-			FMCD_HDL_MANIP,
-			FMCD_HDL_NET_ENV,
-		};
-		int phase;
+		int left = 0;
 
-		for (phase = 0; phase < nitems(teardown_order); phase++) {
-			for (i = 0; i < FMCD_MAX_HANDLES; i++) {
-				t_Handle ptr = sc->handles[i].ptr;
-				t_Error err;
-
-				if (ptr == NULL ||
-				    sc->handles[i].type !=
-				    teardown_order[phase])
-					continue;
-
-				sc->handles[i].ptr = NULL;
-				sc->handles[i].type = FMCD_HDL_NONE;
-
-				switch (teardown_order[phase]) {
-				case FMCD_HDL_NET_ENV:
-					err = FM_PCD_NetEnvCharacteristicsDelete(ptr);
-					break;
-				case FMCD_HDL_KG_SCHEME:
-					err = FM_PCD_KgSchemeDelete(ptr);
-					break;
-				case FMCD_HDL_CC_ROOT:
-					err = FM_PCD_CcRootDelete(ptr);
-					break;
-				case FMCD_HDL_MATCH_TABLE:
-					err = FM_PCD_MatchTableDelete(ptr);
-					break;
-				case FMCD_HDL_HASH_TABLE:
-					err = FM_PCD_HashTableDelete(ptr);
-					break;
-				case FMCD_HDL_MANIP:
-					err = FM_PCD_ManipNodeDelete(ptr);
-					break;
-				case FMCD_HDL_PLCR_PROFILE:
-					err = FM_PCD_PlcrProfileDelete(ptr);
-					break;
-				case FMCD_HDL_FRM_REPLIC:
-					err = FM_PCD_FrmReplicDeleteGroup(ptr);
-					break;
-				default:
-					err = E_OK;
-					break;
-				}
-
-				if (err != E_OK)
-					printf("fmcd: close: failed to "
-					    "delete slot %d type %d\n",
-					    i, teardown_order[phase]);
-			}
+		for (i = 0; i < FMCD_MAX_HANDLES; i++) {
+			if (sc->handles[i].ptr != NULL)
+				left++;
+			sc->handles[i].ptr = NULL;
+			sc->handles[i].type = FMCD_HDL_NONE;
 		}
+		if (left != 0)
+			printf("fmcd: close: offload setup did not finish, "
+			    "%d PCD objects left in place until the next boot\n",
+			    left);
 	}
 
 	/* Bump generation to invalidate any lingering handle IDs */
