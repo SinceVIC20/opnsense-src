@@ -1067,7 +1067,78 @@ dtsec_pcs_diag(struct dtsec_softc *sc)
 	    lpar, ifmode, sc->sc_fixed_link ? "yes" : "no");
 }
 
-/* Turns 1000BASE-X autonegotiation on or off, for links where the far end differs. */
+static uint64_t dtsec_get_counter(if_t, ift_counter);
+
+/* The PCS negotiating, or on a fixed 1G link. */
+static int
+dtsec_pcs_set_an(struct dtsec_softc *sc, bool an)
+{
+	uint16_t bmcr = BMCR_FDX | BMCR_SPEED1;
+
+	if (an)
+		bmcr |= BMCR_AUTOEN | BMCR_STARTNEG;
+	return (MEMAC_MII_WritePhyReg(sc->sc_mach, 0, MII_BMCR, bmcr) == E_OK ?
+	    0 : EIO);
+}
+
+static bool
+dtsec_pcs_link(struct dtsec_softc *sc)
+{
+	uint16_t bmsr;
+
+	/* Link status is latched low: the second read is the current state. */
+	return (MEMAC_MII_ReadPhyReg(sc->sc_mach, 0, MII_BMSR, &bmsr) == E_OK &&
+	    MEMAC_MII_ReadPhyReg(sc->sc_mach, 0, MII_BMSR, &bmsr) == E_OK &&
+	    (bmsr & BMSR_LINK) != 0);
+}
+
+/*
+ * Auto: negotiate first, as most far ends do. With no link for 3 s, try a
+ * fixed 1G link, as some providers need. A fixed link can show up while the
+ * far end still waits to negotiate and sends nothing, so with no frames in
+ * 10 s, or once it drops, negotiate again.
+ */
+static void
+dtsec_pcs_auto_tick(void *arg)
+{
+	struct dtsec_softc *sc = arg;
+	bool link = dtsec_pcs_link(sc);
+	uint64_t rx;
+
+	if (link) {
+		sc->sc_pcs_down = 0;
+		if (sc->sc_pcs_fixed && !sc->sc_pcs_heard) {
+			rx = dtsec_get_counter(sc->sc_ifnet, IFCOUNTER_IPACKETS);
+			if (rx != sc->sc_pcs_rx)
+				sc->sc_pcs_heard = true;
+			else if (++sc->sc_pcs_quiet >= 10) {
+				printf("%s: fixed 1G link brought no frames, "
+				    "negotiating again\n", if_name(sc->sc_ifnet));
+				sc->sc_pcs_fixed = false;
+				dtsec_pcs_set_an(sc, true);
+				link = false;
+			}
+		}
+		if (link && !sc->sc_pcs_link)
+			printf("%s: 1G link up, %s (auto)\n", if_name(sc->sc_ifnet),
+			    sc->sc_pcs_fixed ? "fixed link" : "negotiated");
+	} else if (sc->sc_pcs_link && sc->sc_pcs_fixed) {
+		sc->sc_pcs_fixed = false;
+		sc->sc_pcs_down = 0;
+		dtsec_pcs_set_an(sc, true);
+	} else if (++sc->sc_pcs_down >= 3) {
+		sc->sc_pcs_fixed = !sc->sc_pcs_fixed;
+		sc->sc_pcs_down = 0;
+		sc->sc_pcs_quiet = 0;
+		sc->sc_pcs_heard = false;
+		sc->sc_pcs_rx = dtsec_get_counter(sc->sc_ifnet, IFCOUNTER_IPACKETS);
+		dtsec_pcs_set_an(sc, !sc->sc_pcs_fixed);
+	}
+	sc->sc_pcs_link = link;
+	callout_reset(&sc->sc_pcs_callout, hz, dtsec_pcs_auto_tick, sc);
+}
+
+/* 1000BASE-X autonegotiation for links where the far end differs: 0 off, 1 on, 2 auto. */
 static int
 dtsec_sysctl_pcs_autoneg(SYSCTL_HANDLER_ARGS)
 {
@@ -1075,19 +1146,50 @@ dtsec_sysctl_pcs_autoneg(SYSCTL_HANDLER_ARGS)
 	uint16_t bmcr;
 	int val, error;
 
-	if (MEMAC_MII_ReadPhyReg(sc->sc_mach, 0, MII_BMCR, &bmcr) != E_OK)
+	if (sc->sc_pcs_mode == 2)
+		val = 2;
+	else if (MEMAC_MII_ReadPhyReg(sc->sc_mach, 0, MII_BMCR, &bmcr) != E_OK)
 		return (EIO);
-	val = (bmcr & BMCR_AUTOEN) != 0;
+	else
+		val = (bmcr & BMCR_AUTOEN) != 0;
 	error = sysctl_handle_int(oidp, &val, 0, req);
 	if (error || req->newptr == NULL)
 		return (error);
+	if (val < 0 || val > 2)
+		return (EINVAL);
 
-	bmcr = BMCR_FDX | BMCR_SPEED1;
-	if (val != 0)
-		bmcr |= BMCR_AUTOEN | BMCR_STARTNEG;
-	if (MEMAC_MII_WritePhyReg(sc->sc_mach, 0, MII_BMCR, bmcr) != E_OK)
+	mtx_lock(&sc->sc_pcs_lock);
+	if (val == 2) {
+		if (sc->sc_pcs_mode != 2) {
+			sc->sc_pcs_mode = 2;
+			sc->sc_pcs_fixed = false;
+			sc->sc_pcs_link = false;
+			sc->sc_pcs_down = 0;
+			error = dtsec_pcs_set_an(sc, true);
+			callout_reset(&sc->sc_pcs_callout, hz,
+			    dtsec_pcs_auto_tick, sc);
+		}
+	} else {
+		callout_stop(&sc->sc_pcs_callout);
+		sc->sc_pcs_mode = val;
+		error = dtsec_pcs_set_an(sc, val != 0);
+	}
+	mtx_unlock(&sc->sc_pcs_lock);
+	return (error);
+}
+
+/* Whether the PCS negotiates right now, which auto can change. */
+static int
+dtsec_sysctl_pcs_autoneg_now(SYSCTL_HANDLER_ARGS)
+{
+	struct dtsec_softc *sc = (struct dtsec_softc *)arg1;
+	uint16_t bmcr;
+	int val;
+
+	if (MEMAC_MII_ReadPhyReg(sc->sc_mach, 0, MII_BMCR, &bmcr) != E_OK)
 		return (EIO);
-	return (0);
+	val = (bmcr & BMCR_AUTOEN) != 0;
+	return (sysctl_handle_int(oidp, &val, 0, req));
 }
 #endif
 
@@ -1487,10 +1589,13 @@ dtsec_attach(device_t dev)
 
 	mtx_init(&sc->sc_mac_stats_lock, device_get_nameunit(dev),
 	    "DTSEC MAC counters", MTX_DEF);
+	mtx_init(&sc->sc_pcs_lock, device_get_nameunit(dev),
+	    "DTSEC 1G autonegotiation", MTX_DEF);
 
 	/* Init callouts */
 	callout_init(&sc->sc_tick_callout, CALLOUT_MPSAFE);
 	callout_init_mtx(&sc->sc_mac_stats_callout, &sc->sc_mac_stats_lock, 0);
+	callout_init_mtx(&sc->sc_pcs_callout, &sc->sc_pcs_lock, 0);
 
 	/* Read configuraton */
 	if ((error = fman_get_handle(parent, &sc->sc_fmh)) != 0)
@@ -1708,7 +1813,13 @@ dtsec_attach(device_t dev)
 			    "pcs_autoneg",
 			    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 			    sc, 0, dtsec_sysctl_pcs_autoneg, "I",
-			    "1000BASE-X autonegotiation (0 = off, 1 = on)");
+			    "1000BASE-X autonegotiation (0 = off, 1 = on, 2 = auto)");
+		if (sc->sc_mac_enet_mode & ENET_IF_SGMII_BASEX)
+			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+			    "pcs_autoneg_now",
+			    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+			    sc, 0, dtsec_sysctl_pcs_autoneg_now, "I",
+			    "1000BASE-X autonegotiation in use now (0 = off, 1 = on)");
 #endif
 
 		if (sc->sc_sfp_dev != NULL) {
@@ -1776,12 +1887,14 @@ dtsec_detach(device_t dev)
 	}
 
 	callout_drain(&sc->sc_mac_stats_callout);
+	callout_drain(&sc->sc_pcs_callout);
 	dtsec_fm_mac_free(sc);
 	dtsec_fm_port_free_both(sc);
 
 	/* Destroy lock */
 	mtx_destroy(&sc->sc_lock);
 	mtx_destroy(&sc->sc_mac_stats_lock);
+	mtx_destroy(&sc->sc_pcs_lock);
 
 	return (0);
 }

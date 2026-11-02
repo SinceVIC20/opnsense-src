@@ -114,6 +114,20 @@ struct dtsec_softc {
 	uint64_t			sc_mac_total[7];
 	uint64_t			sc_mac_obytes_raw;	/* last raw read */
 
+	/*
+	 * 1000BASE-X autonegotiation: 0 off, 1 on, 2 auto (negotiate, else a
+	 * fixed 1G link). Auto's state is checked once a second.
+	 */
+	struct mtx			sc_pcs_lock;
+	struct callout			sc_pcs_callout;
+	int				sc_pcs_mode;
+	bool				sc_pcs_fixed;	/* auto is on a fixed link now */
+	bool				sc_pcs_link;	/* link at the last check */
+	bool				sc_pcs_heard;	/* frames came in on the fixed link */
+	int				sc_pcs_down;	/* seconds without link */
+	int				sc_pcs_quiet;	/* seconds fixed with link, no frames */
+	uint64_t			sc_pcs_rx;	/* frames in when the fixed link began */
+
 	/* RX Pool */
 	t_Handle			sc_rx_pool;
 	uint8_t				sc_rx_bpid;
