@@ -103,6 +103,17 @@ struct dtsec_softc {
 
 	struct callout			sc_tick_callout;
 
+	/*
+	 * MAC counters widened to 64 bits in software: the hardware's upper
+	 * words don't count, so each counter wraps at 2^32 (3.4 s of 10G).
+	 */
+	struct mtx			sc_mac_stats_lock;
+	struct callout			sc_mac_stats_callout;
+	bool				sc_mac_stats_valid;
+	uint32_t			sc_mac_last[7];
+	uint64_t			sc_mac_total[7];
+	uint64_t			sc_mac_obytes_raw;	/* last raw read */
+
 	/* RX Pool */
 	t_Handle			sc_rx_pool;
 	uint8_t				sc_rx_bpid;

@@ -1385,34 +1385,79 @@ dtsec_sysctl_sfp_phy_modes(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
 }
 
+/* Slots in sc_mac_last/sc_mac_total, in dtsec_mac_stats_update() order. */
+enum { MAC_IPKTS, MAC_OPKTS, MAC_IBYTES, MAC_OBYTES, MAC_IERRS, MAC_OERRS,
+	MAC_IMCASTS };
+
+/* Add what each MAC counter moved since the last read, low 32 bits only. */
+static void
+dtsec_mac_stats_update(struct dtsec_softc *sc)
+{
+	t_FmMacStatistics ms;
+	uint64_t raw[7];
+	uint32_t cur;
+	int i;
+
+	mtx_assert(&sc->sc_mac_stats_lock, MA_OWNED);
+	if (sc->sc_mach == NULL ||
+	    FM_MAC_GetStatistics(sc->sc_mach, &ms) != E_OK)
+		return;
+	raw[MAC_IPKTS] = ms.ifInPkts;
+	raw[MAC_OPKTS] = ms.ifOutPkts;
+	raw[MAC_IBYTES] = ms.ifInOctets;
+	raw[MAC_OBYTES] = ms.ifOutOctets;
+	raw[MAC_IERRS] = ms.ifInErrors;
+	raw[MAC_OERRS] = ms.ifOutErrors;
+	raw[MAC_IMCASTS] = ms.ifInMcastPkts;
+	sc->sc_mac_obytes_raw = ms.ifOutOctets;
+	for (i = 0; i < 7; i++) {
+		cur = (uint32_t)raw[i];
+		if (sc->sc_mac_stats_valid)
+			sc->sc_mac_total[i] += (uint32_t)(cur - sc->sc_mac_last[i]);
+		else
+			sc->sc_mac_total[i] = cur;
+		sc->sc_mac_last[i] = cur;
+	}
+	sc->sc_mac_stats_valid = true;
+}
+
+/* Once a second, well inside the 3.4 s a 10G port takes to wrap. */
+static void
+dtsec_mac_stats_tick(void *arg)
+{
+	struct dtsec_softc *sc = arg;
+
+	dtsec_mac_stats_update(sc);
+	callout_reset(&sc->sc_mac_stats_callout, hz, dtsec_mac_stats_tick, sc);
+}
+
 static uint64_t
 dtsec_get_counter(if_t ifp, ift_counter cnt)
 {
 	struct dtsec_softc *sc = if_getsoftc(ifp);
-	t_FmMacStatistics ms;
+	uint64_t v;
+	int slot;
 
-	if (sc->sc_mach != NULL &&
-	    FM_MAC_GetStatistics(sc->sc_mach, &ms) == E_OK) {
-		switch (cnt) {
-		case IFCOUNTER_IPACKETS:
-			return (ms.ifInPkts);
-		case IFCOUNTER_OPACKETS:
-			return (ms.ifOutPkts);
-		case IFCOUNTER_IBYTES:
-			return (ms.ifInOctets);
-		case IFCOUNTER_OBYTES:
-			return (ms.ifOutOctets);
-		case IFCOUNTER_IERRORS:
-			return (ms.ifInErrors);
-		case IFCOUNTER_OERRORS:
-			return (ms.ifOutErrors);
-		case IFCOUNTER_IMCASTS:
-			return (ms.ifInMcastPkts);
-		default:
-			break;
-		}
+	switch (cnt) {
+	case IFCOUNTER_IPACKETS:	slot = MAC_IPKTS; break;
+	case IFCOUNTER_OPACKETS:	slot = MAC_OPKTS; break;
+	case IFCOUNTER_IBYTES:		slot = MAC_IBYTES; break;
+	case IFCOUNTER_OBYTES:		slot = MAC_OBYTES; break;
+	case IFCOUNTER_IERRORS:		slot = MAC_IERRS; break;
+	case IFCOUNTER_OERRORS:		slot = MAC_OERRS; break;
+	case IFCOUNTER_IMCASTS:		slot = MAC_IMCASTS; break;
+	default:
+		return (if_get_counter_default(ifp, cnt));
 	}
-	return (if_get_counter_default(ifp, cnt));
+	mtx_lock(&sc->sc_mac_stats_lock);
+	dtsec_mac_stats_update(sc);
+	if (!sc->sc_mac_stats_valid) {
+		mtx_unlock(&sc->sc_mac_stats_lock);
+		return (if_get_counter_default(ifp, cnt));
+	}
+	v = sc->sc_mac_total[slot];
+	mtx_unlock(&sc->sc_mac_stats_lock);
+	return (v);
 }
 
 int
@@ -1440,8 +1485,12 @@ dtsec_attach(device_t dev)
 	mtx_init(&sc->sc_mii_lock, device_get_nameunit(dev),
 	    "DTSEC MII Lock", MTX_DEF);
 
+	mtx_init(&sc->sc_mac_stats_lock, device_get_nameunit(dev),
+	    "DTSEC MAC counters", MTX_DEF);
+
 	/* Init callouts */
 	callout_init(&sc->sc_tick_callout, CALLOUT_MPSAFE);
+	callout_init_mtx(&sc->sc_mac_stats_callout, &sc->sc_mac_stats_lock, 0);
 
 	/* Read configuraton */
 	if ((error = fman_get_handle(parent, &sc->sc_fmh)) != 0)
@@ -1568,6 +1617,10 @@ dtsec_attach(device_t dev)
 	/* Attach to stack */
 	ether_ifattach(ifp, sc->sc_mac_addr);
 
+	mtx_lock(&sc->sc_mac_stats_lock);
+	dtsec_mac_stats_tick(sc);
+	mtx_unlock(&sc->sc_mac_stats_lock);
+
 	/* Set baudrate */
 	if (ENET_SPEED_FROM_MODE(sc->sc_mac_enet_mode) == e_ENET_SPEED_10000)
 		if_setbaudrate(ifp, IF_Gbps(10ULL));
@@ -1630,6 +1683,9 @@ dtsec_attach(device_t dev)
 		    sc, e_FM_PORT_COUNTERS_RX_OUT_OF_BUFFERS_DISCARD,
 		    dtsec_sysctl_rx_counter, "IU",
 		    "Frames dropped because the RX pool was empty");
+		SYSCTL_ADD_U64(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    "mac_obytes_raw", CTLFLAG_RD, &sc->sc_mac_obytes_raw, 0,
+		    "Bytes sent as the MAC's own 64-bit counter reads");
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		    "cpu_ibytes", CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
 		    sc, IFCOUNTER_IBYTES, dtsec_sysctl_cpu_counter, "QU",
@@ -1719,11 +1775,13 @@ dtsec_detach(device_t dev)
 		dtsec_rm_pool_rx_free(sc);
 	}
 
+	callout_drain(&sc->sc_mac_stats_callout);
 	dtsec_fm_mac_free(sc);
 	dtsec_fm_port_free_both(sc);
 
 	/* Destroy lock */
 	mtx_destroy(&sc->sc_lock);
+	mtx_destroy(&sc->sc_mac_stats_lock);
 
 	return (0);
 }
