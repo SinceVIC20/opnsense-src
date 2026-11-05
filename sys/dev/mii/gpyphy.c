@@ -180,6 +180,35 @@ gpyphy_sgmii_aneg(struct mii_softc *sc)
 	gpyphy_mmd_write(sc, MDIO_MMD_VEND1, VSPEC1_SGMII_CTRL, val);
 }
 
+/*
+ * 1000baseT can't be forced, and forcing it left the PHY at half duplex,
+ * which the MAC can't run, so a fixed 1000baseT negotiates 1000 full only.
+ */
+static void
+gpyphy_setmedia(struct mii_softc *sc)
+{
+	struct ifmedia_entry *ife = sc->mii_pdata->mii_media.ifm_cur;
+	int gtcr;
+
+	switch (IFM_SUBTYPE(ife->ifm_media)) {
+	case IFM_AUTO:
+		/* Offer every speed again, also after a fixed 1000baseT. */
+		(void)mii_phy_auto(sc);
+		break;
+	case IFM_1000_T:
+		gtcr = GTCR_ADV_1000TFDX;
+		if ((ife->ifm_media & IFM_ETH_MASTER) != 0)
+			gtcr |= GTCR_MAN_MS | GTCR_ADV_MS;
+		PHY_WRITE(sc, MII_ANAR, ANAR_CSMA);
+		PHY_WRITE(sc, MII_100T2CR, gtcr);
+		PHY_WRITE(sc, MII_BMCR, BMCR_AUTOEN | BMCR_STARTNEG);
+		break;
+	default:
+		mii_phy_setmedia(sc);
+		break;
+	}
+}
+
 static int
 gpyphy_probe(device_t dev)
 {
@@ -228,7 +257,7 @@ gpyphy_service(struct mii_softc *sc, struct mii_data *mii, int cmd)
 		break;
 
 	case MII_MEDIACHG:
-		mii_phy_setmedia(sc);
+		gpyphy_setmedia(sc);
 		/* Re-trigger SGMII AN after media change */
 		gpyphy_sgmii_aneg(sc);
 		break;
