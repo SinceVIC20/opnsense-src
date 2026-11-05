@@ -75,6 +75,10 @@
 /* MMD device address for vendor-specific registers */
 #define	MDIO_MMD_VEND1		30
 
+/* EEE advertisement (MMD7) */
+#define	MDIO_MMD_AN		7
+#define	MDIO_AN_EEE_ADV		60
+
 /* VSPEC1 (MMD30) registers */
 #define	VSPEC1_SGMII_CTRL	0x08
 #define	VSPEC1_SGMII_CTRL_ANEN	(1 << 12)	/* SGMII AN enable */
@@ -190,6 +194,9 @@ gpyphy_setmedia(struct mii_softc *sc)
 	struct ifmedia_entry *ife = sc->mii_pdata->mii_media.ifm_cur;
 	int gtcr;
 
+	/* Don't offer EEE: with some switches it drops the link under traffic. */
+	gpyphy_mmd_write(sc, MDIO_MMD_AN, MDIO_AN_EEE_ADV, 0);
+
 	switch (IFM_SUBTYPE(ife->ifm_media)) {
 	case IFM_AUTO:
 		/* Offer every speed again, also after a fixed 1000baseT. */
@@ -242,7 +249,7 @@ gpyphy_attach(device_t dev)
 	/* Enable SGMII auto-negotiation — critical for MAC-side link */
 	gpyphy_sgmii_aneg(sc);
 
-	mii_phy_setmedia(sc);
+	gpyphy_setmedia(sc);
 
 	return (0);
 }
