@@ -872,6 +872,8 @@ dtsec_rm_fqr_mext_free(struct mbuf *m)
 	atomic_subtract_32(&sc->sc_rx_cpu_held, 1);
 }
 
+static uint32_t dtsec_rx_hashkey;
+
 static e_RxStoreResponse
 dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
     uint32_t fqid_off, t_DpaaFD *frame)
@@ -1031,6 +1033,17 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 	m->m_pkthdr.len = len;
 	m->m_pkthdr.csum_flags |= rx_csum_flags;
 	m->m_pkthdr.csum_data = rx_csum_data;
+
+	/*
+	 * Every frame between two hosts lands on the same queue and core. A
+	 * flow hash lets netisr spread IP and TCP over the cores when
+	 * net.isr.dispatch is deferred or hybrid.
+	 */
+	if (__predict_false(dtsec_rx_hashkey == 0))
+		dtsec_rx_hashkey = m_ether_tcpip_hash_init();
+	m->m_pkthdr.flowid = m_ether_tcpip_hash(MBUF_HASHFLAG_L3 |
+	    MBUF_HASHFLAG_L4, m, dtsec_rx_hashkey);
+	M_HASHTYPE_SET(m, M_HASHTYPE_OPAQUE_HASH);
 
 	/* ether_input() counts the bytes. */
 	if_inc_counter(sc->sc_ifnet, IFCOUNTER_IPACKETS, 1);
