@@ -219,6 +219,7 @@ void tcp_lro_flush_inactive(struct lro_ctrl *, const struct timeval *);
 void tcp_lro_flush_all(struct lro_ctrl *);
 extern int (*tcp_lro_flush_tcphpts)(struct lro_ctrl *, struct lro_entry *);
 int tcp_lro_rx(struct lro_ctrl *, struct mbuf *, uint32_t);
+int tcp_lro_rx_local(struct lro_ctrl *, struct mbuf *, uint32_t);
 void tcp_lro_queue_mbuf(struct lro_ctrl *, struct mbuf *);
 void tcp_lro_reg_mbufq(void);
 void tcp_lro_dereg_mbufq(void);

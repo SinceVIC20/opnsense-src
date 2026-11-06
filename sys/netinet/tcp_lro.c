@@ -82,7 +82,7 @@ static MALLOC_DEFINE(M_LRO, "LRO", "LRO control structures");
 
 static void	tcp_lro_rx_done(struct lro_ctrl *lc);
 static int	tcp_lro_rx_common(struct lro_ctrl *lc, struct mbuf *m,
-		    uint32_t csum, bool use_hash);
+		    uint32_t csum, bool use_hash, bool local);
 static void	tcp_lro_flush(struct lro_ctrl *lc, struct lro_entry *le);
 
 SYSCTL_NODE(_net_inet_tcp, OID_AUTO, lro,  CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
@@ -1245,7 +1245,7 @@ tcp_lro_flush_all(struct lro_ctrl *lc)
 		}
 
 		/* add packet to LRO engine */
-		if (tcp_lro_rx_common(lc, mb, 0, false) != 0) {
+		if (tcp_lro_rx_common(lc, mb, 0, false, false) != 0) {
  			/* Flush anything we have acummulated */
  			tcp_lro_flush_active(lc);
 			/* input packet to network layer */
@@ -1277,7 +1277,8 @@ tcp_lro_rx_get_bucket(struct lro_ctrl *lc, struct mbuf *m, struct lro_parser *pa
 }
 
 static int
-tcp_lro_rx_common(struct lro_ctrl *lc, struct mbuf *m, uint32_t csum, bool use_hash)
+tcp_lro_rx_common(struct lro_ctrl *lc, struct mbuf *m, uint32_t csum, bool use_hash,
+    bool local)
 {
 	struct lro_parser pi;	/* inner address data */
 	struct lro_parser po;	/* outer address data */
@@ -1290,14 +1291,16 @@ tcp_lro_rx_common(struct lro_ctrl *lc, struct mbuf *m, uint32_t csum, bool use_h
 	int error;
 	uint16_t tcp_data_sum;
 
+	/*
+	 * A forwarding host must not merge what it may forward, unless the
+	 * caller knows the segment is for a local connection.
+	 */
 #ifdef INET
-	/* Quickly decide if packet cannot be LRO'ed */
-	if (__predict_false(V_ipforwarding != 0))
+	if (__predict_false(V_ipforwarding != 0 && !local))
 		return (TCP_LRO_CANNOT);
 #endif
 #ifdef INET6
-	/* Quickly decide if packet cannot be LRO'ed */
-	if (__predict_false(V_ip6_forwarding != 0))
+	if (__predict_false(V_ip6_forwarding != 0 && !local))
 		return (TCP_LRO_CANNOT);
 #endif
 	if (((m->m_pkthdr.csum_flags & (CSUM_DATA_VALID | CSUM_PSEUDO_HDR)) !=
@@ -1423,15 +1426,16 @@ tcp_lro_rx_common(struct lro_ctrl *lc, struct mbuf *m, uint32_t csum, bool use_h
 	return (0);
 }
 
-int
-tcp_lro_rx(struct lro_ctrl *lc, struct mbuf *m, uint32_t csum)
+static int
+tcp_lro_rx_flagged(struct lro_ctrl *lc, struct mbuf *m, uint32_t csum,
+    bool local)
 {
 	int error;
 
 	/* get current time */
 	binuptime(&lc->lro_last_queue_time);
 	CURVNET_SET(lc->ifp->if_vnet);
-	error = tcp_lro_rx_common(lc, m, csum, true);
+	error = tcp_lro_rx_common(lc, m, csum, true, local);
 	if (__predict_false(error != 0)) {
 		/*
 		 * Flush anything we have acummulated
@@ -1443,6 +1447,22 @@ tcp_lro_rx(struct lro_ctrl *lc, struct mbuf *m, uint32_t csum)
 	CURVNET_RESTORE();
 
 	return (error);
+}
+
+int
+tcp_lro_rx(struct lro_ctrl *lc, struct mbuf *m, uint32_t csum)
+{
+	return (tcp_lro_rx_flagged(lc, m, csum, false));
+}
+
+/*
+ * As tcp_lro_rx(), also on a forwarding host: the caller has checked that
+ * the segment belongs to a local connection, so it is never forwarded.
+ */
+int
+tcp_lro_rx_local(struct lro_ctrl *lc, struct mbuf *m, uint32_t csum)
+{
+	return (tcp_lro_rx_flagged(lc, m, csum, true));
 }
 
 void

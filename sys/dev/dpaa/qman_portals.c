@@ -24,6 +24,8 @@
  * SUCH DAMAGE.
  */
 
+#include "opt_inet.h"
+#include "opt_inet6.h"
 #include "opt_platform.h"
 
 #include <sys/param.h>
@@ -31,6 +33,7 @@
 #include <sys/kernel.h>
 #include <sys/bus.h>
 #include <sys/lock.h>
+#include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/proc.h>
@@ -217,15 +220,180 @@ err:
 #include <sys/epoch.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
+#include <net/ethernet.h>
 #include <net/if.h>
 #include <net/if_var.h>
+#include <net/vnet.h>
+#include <netinet/in.h>
+#include <netinet/in_pcb.h>
+#include <netinet/in_systm.h>
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
+#include <netinet/tcp.h>
+#include <netinet/tcp_lro.h>
+#include <netinet/tcp_var.h>
+#ifdef INET6
+#include <netinet6/in6_pcb.h>
+#endif
+
+/* Ports one core keeps an LRO table for. */
+#define	QMAN_LRO_IFS	8
+
+struct qman_lro {
+	if_t		ifp;
+	bool		ready;
+	struct lro_ctrl	lc;
+};
 
 /* Per-portal NAPI state */
 static struct {
 	struct task	task;
 	struct taskqueue *tq;
 	struct mbufq	rxq;		/* deferred RX mbufs */
+	struct qman_lro	*lro;		/* QMAN_LRO_IFS tables */
 } qman_napi[MAXCPU];
+
+/*
+ * LRO for TCP that ends on this box. Stock LRO is off on a forwarding host,
+ * since a merged segment must never be forwarded, so only segments of a
+ * connection the box itself holds are merged.
+ */
+static SYSCTL_NODE(_hw, OID_AUTO, dpaa, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "DPAA");
+
+static int qman_rx_lro = 1;
+SYSCTL_INT(_hw_dpaa, OID_AUTO, rx_lro, CTLFLAG_RWTUN, &qman_rx_lro, 0,
+    "Merge received TCP segments of local connections (LRO)");
+
+static int
+qman_rx_lro_stat(SYSCTL_HANDLER_ARGS)
+{
+	uint64_t sum;
+	int cpu, i;
+
+	sum = 0;
+	CPU_FOREACH(cpu) {
+		if (qman_napi[cpu].lro == NULL)
+			continue;
+		for (i = 0; i < QMAN_LRO_IFS; i++) {
+			if (!qman_napi[cpu].lro[i].ready)
+				continue;
+			sum += arg2 == 0 ? qman_napi[cpu].lro[i].lc.lro_queued :
+			    qman_napi[cpu].lro[i].lc.lro_flushed;
+		}
+	}
+	return (sysctl_handle_64(oidp, &sum, 0, req));
+}
+SYSCTL_PROC(_hw_dpaa, OID_AUTO, rx_lro_segments,
+    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, qman_rx_lro_stat, "QU",
+    "TCP segments that went through LRO");
+SYSCTL_PROC(_hw_dpaa, OID_AUTO, rx_lro_packets,
+    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 1, qman_rx_lro_stat, "QU",
+    "Packets LRO passed up after merging");
+
+/* This core's LRO table for @ifp, made on first use; NULL if none. */
+static struct lro_ctrl *
+qman_rx_lro_ctrl(int cpu, if_t ifp, int *idx)
+{
+	struct qman_lro *l;
+	int i;
+
+	l = qman_napi[cpu].lro;
+	if (__predict_false(l == NULL))
+		return (NULL);
+	for (i = 0; i < QMAN_LRO_IFS; i++) {
+		if (l[i].ifp == NULL) {
+			l[i].ifp = ifp;
+			l[i].ready = tcp_lro_init_args(&l[i].lc, ifp,
+			    TCP_LRO_ENTRIES, 0) == 0;
+		}
+		if (l[i].ifp == ifp) {
+			*idx = i;
+			return (l[i].ready ? &l[i].lc : NULL);
+		}
+	}
+	return (NULL);
+}
+
+/*
+ * 1 when @m is a TCP segment, checksum checked by the hardware, of a
+ * connection on this box (exact match, so port forwards never qualify);
+ * -1 when it is TCP whose checksum the hardware did not pass, so what LRO
+ * holds goes up first and the order stays; 0 otherwise.
+ */
+static int
+qman_rx_lro_local(struct mbuf *m)
+{
+	struct inpcb *inp;
+	struct tcphdr *th;
+	uint16_t etype;
+	bool csum_ok;
+	int off;
+
+	if (m->m_len < ETHER_HDR_LEN)
+		return (0);
+	etype = ntohs(mtod(m, struct ether_header *)->ether_type);
+	off = ETHER_HDR_LEN;
+	if (etype == ETHERTYPE_VLAN) {
+		if (m->m_len < sizeof(struct ether_vlan_header))
+			return (0);
+		etype = ntohs(mtod(m, struct ether_vlan_header *)->evl_proto);
+		off = sizeof(struct ether_vlan_header);
+	}
+	csum_ok = (m->m_pkthdr.csum_flags & (CSUM_DATA_VALID |
+	    CSUM_PSEUDO_HDR)) == (CSUM_DATA_VALID | CSUM_PSEUDO_HDR) &&
+	    m->m_pkthdr.csum_data == 0xffff;
+
+	inp = NULL;
+	switch (etype) {
+#ifdef INET
+	case ETHERTYPE_IP: {
+		struct ip *ip;
+
+		if (m->m_len < off + sizeof(*ip) + sizeof(*th))
+			return (0);
+		ip = (struct ip *)(mtod(m, char *) + off);
+		if (ip->ip_p != IPPROTO_TCP)
+			return (0);
+		if (!csum_ok)
+			return (-1);
+		if (ip->ip_hl != sizeof(*ip) >> 2 ||
+		    (ip->ip_off & htons(IP_MF | IP_OFFMASK)) != 0)
+			return (0);
+		th = (struct tcphdr *)(ip + 1);
+		inp = in_pcblookup(&V_tcbinfo, ip->ip_src, th->th_sport,
+		    ip->ip_dst, th->th_dport, INPLOOKUP_RLOCKPCB,
+		    m->m_pkthdr.rcvif);
+		break;
+	}
+#endif
+#ifdef INET6
+	case ETHERTYPE_IPV6: {
+		struct ip6_hdr *ip6;
+
+		if (m->m_len < off + sizeof(*ip6) + sizeof(*th))
+			return (0);
+		ip6 = (struct ip6_hdr *)(mtod(m, char *) + off);
+		if (ip6->ip6_nxt != IPPROTO_TCP)
+			return (0);
+		if (!csum_ok)
+			return (-1);
+		th = (struct tcphdr *)(ip6 + 1);
+		inp = in6_pcblookup(&V_tcbinfo, &ip6->ip6_src, th->th_sport,
+		    &ip6->ip6_dst, th->th_dport, INPLOOKUP_RLOCKPCB,
+		    m->m_pkthdr.rcvif);
+		break;
+	}
+#endif
+	default:
+		return (0);
+	}
+	if (inp == NULL)
+		return (0);
+	INP_RUNLOCK(inp);
+	return (1);
+}
 
 /* Declared in xx_arm64.c */
 extern void XX_ConfigPortalNapi(uintptr_t irq, struct taskqueue *tq,
@@ -265,11 +433,23 @@ static void
 qman_portal_poll_task(void *arg, int pending)
 {
 	t_Handle portal = arg;
+	struct epoch_tracker et;
+	struct lro_ctrl *lc;
 	struct mbuf *m;
+	uint32_t held;
+	bool lro;
 	int cpu = PCPU_GET(cpuid);
+	int i, ok;
 
 	QM_PORTAL_Poll(portal, e_QM_PORTAL_POLL_SOURCE_BOTH);
 	QM_PORTAL_Uninhibit(portal);
+
+	if (mbufq_len(&qman_napi[cpu].rxq) == 0)
+		return;
+
+	lro = atomic_load_int(&qman_rx_lro) != 0;
+	held = 0;
+	NET_EPOCH_ENTER(et);
 
 	/*
 	 * Deliver deferred mbufs outside NCSW_PLOCK.
@@ -280,10 +460,30 @@ qman_portal_poll_task(void *arg, int pending)
 		if (__predict_false(m->m_flags & M_PROTO1)) {
 			m->m_flags &= ~M_PROTO1;
 			if_transmit(m->m_pkthdr.rcvif, m);
-		} else {
-			if_input(m->m_pkthdr.rcvif, m);
+			continue;
 		}
+		if (lro && (lc = qman_rx_lro_ctrl(cpu, m->m_pkthdr.rcvif,
+		    &i)) != NULL) {
+			CURVNET_SET(if_getvnet(lc->ifp));
+			ok = qman_rx_lro_local(m);
+			CURVNET_RESTORE();
+			if (ok == 1 && tcp_lro_rx_local(lc, m, 0) == 0) {
+				held |= 1u << i;
+				continue;
+			}
+			if (ok == -1 && (held & (1u << i)) != 0) {
+				tcp_lro_flush_all(lc);
+				held &= ~(1u << i);
+			}
+		}
+		if_input(m->m_pkthdr.rcvif, m);
 	}
+
+	/* Everything merged goes up before the next poll. */
+	for (i = 0; held != 0; i++, held >>= 1)
+		if (held & 1)
+			tcp_lro_flush_all(&qman_napi[cpu].lro[i].lc);
+	NET_EPOCH_EXIT(et);
 }
 
 /*
@@ -352,6 +552,9 @@ qman_portal_init_cpu(struct qman_softc *qsc, int cpu)
 
 	/* Init deferred RX mbuf queue (unlimited — DQRR ring is the natural cap) */
 	mbufq_init(&qman_napi[cpu].rxq, 0);
+	if (qman_napi[cpu].lro == NULL)
+		qman_napi[cpu].lro = malloc(sizeof(struct qman_lro) *
+		    QMAN_LRO_IFS, M_DEVBUF, M_WAITOK | M_ZERO);
 
 	/*
 	 * Create per-CPU taskqueue for NAPI-style polling.
