@@ -879,7 +879,7 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 	struct dtsec_softc *sc;
 	struct mbuf *m;
 	void *frame_va;
-	uint32_t csum_data, csum_flags, len;
+	uint32_t rx_csum_data, rx_csum_flags, len;
 
 	m = NULL;
 	sc = app;
@@ -951,8 +951,8 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 	 * software, same as toggling the GUI checkbox off should mean.
 	 * Read before the copy below hands the buffer back.
 	 */
-	csum_flags = 0;
-	csum_data = 0;
+	rx_csum_flags = 0;
+	rx_csum_data = 0;
 	if (sc->sc_rx_data_offset > 0 &&
 	    (if_getcapenable(sc->sc_ifnet) &
 	    (IFCAP_RXCSUM | IFCAP_RXCSUM_IPV6))) {
@@ -969,7 +969,7 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 			    (if_getcapenable(sc->sc_ifnet) & IFCAP_RXCSUM_IPV6));
 
 			if (cap_ok) {
-				csum_flags |= CSUM_L3_CALC | CSUM_L3_VALID;
+				rx_csum_flags |= CSUM_L3_CALC | CSUM_L3_VALID;
 
 				if (prs->l4r & (FM_L4_PARSE_RESULT_TCP |
 				    FM_L4_PARSE_RESULT_UDP)) {
@@ -988,9 +988,9 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 					 * packet as a checksum failure.
 					 */
 					if (!(fd_status & FM_FD_CMD_DCL4C)) {
-						csum_flags |=
+						rx_csum_flags |=
 						    CSUM_L4_CALC | CSUM_L4_VALID;
-						csum_data = 0xffff;
+						rx_csum_data = 0xffff;
 					}
 				}
 			}
@@ -1029,8 +1029,8 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 	m->m_pkthdr.rcvif = sc->sc_ifnet;
 	m->m_len = len;
 	m->m_pkthdr.len = len;
-	m->m_pkthdr.csum_flags |= csum_flags;
-	m->m_pkthdr.csum_data = csum_data;
+	m->m_pkthdr.csum_flags |= rx_csum_flags;
+	m->m_pkthdr.csum_data = rx_csum_data;
 
 	/* ether_input() counts the bytes. */
 	if_inc_counter(sc->sc_ifnet, IFCOUNTER_IPACKETS, 1);
