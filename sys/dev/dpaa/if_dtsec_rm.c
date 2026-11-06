@@ -879,6 +879,7 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 	struct dtsec_softc *sc;
 	struct mbuf *m;
 	void *frame_va;
+	uint32_t csum_data, csum_flags, len;
 
 	m = NULL;
 	sc = app;
@@ -943,30 +944,15 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 		}
 	}
 
-	if (!dtsec_rm_rx_cpu_take(sc, frame_va))
-		return (e_RX_STORE_RESPONSE_CONTINUE);
-
-	m = m_gethdr(M_NOWAIT, MT_HEADER);
-	if (m == NULL) {
-		atomic_subtract_32(&sc->sc_rx_cpu_held, 1);
-		goto err;
-	}
-
-	m_extadd(m, frame_va, FM_PORT_BUFFER_SIZE,
-	    dtsec_rm_fqr_mext_free, frame_va, sc, 0,
-	    EXT_NET_DRV);
-
-	m->m_pkthdr.rcvif = sc->sc_ifnet;
-	m->m_data = (char *)frame_va + DPAA_FD_GET_OFFSET(frame);
-	m->m_len = DPAA_FD_GET_LENGTH(frame);
-	m->m_pkthdr.len = m->m_len;
-
 	/*
 	 * Extract RX checksum result from parse result in buffer prefix,
 	 * but only if the matching RX checksum capability is enabled -
 	 * otherwise leave csum_flags untouched so the stack verifies in
 	 * software, same as toggling the GUI checkbox off should mean.
+	 * Read before the copy below hands the buffer back.
 	 */
+	csum_flags = 0;
+	csum_data = 0;
 	if (sc->sc_rx_data_offset > 0 &&
 	    (if_getcapenable(sc->sc_ifnet) &
 	    (IFCAP_RXCSUM | IFCAP_RXCSUM_IPV6))) {
@@ -983,8 +969,7 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 			    (if_getcapenable(sc->sc_ifnet) & IFCAP_RXCSUM_IPV6));
 
 			if (cap_ok) {
-				m->m_pkthdr.csum_flags |=
-				    CSUM_L3_CALC | CSUM_L3_VALID;
+				csum_flags |= CSUM_L3_CALC | CSUM_L3_VALID;
 
 				if (prs->l4r & (FM_L4_PARSE_RESULT_TCP |
 				    FM_L4_PARSE_RESULT_UDP)) {
@@ -1003,16 +988,49 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 					 * packet as a checksum failure.
 					 */
 					if (!(fd_status & FM_FD_CMD_DCL4C)) {
-						m->m_pkthdr.csum_flags |=
-						    CSUM_L4_CALC |
-						    CSUM_L4_VALID;
-						m->m_pkthdr.csum_data =
-						    0xffff;
+						csum_flags |=
+						    CSUM_L4_CALC | CSUM_L4_VALID;
+						csum_data = 0xffff;
 					}
 				}
 			}
 		}
 	}
+
+	len = DPAA_FD_GET_LENGTH(frame);
+
+	/*
+	 * A frame that fits a cluster is copied, so its pool buffer goes back
+	 * now instead of waiting in a socket, and it never counts against the
+	 * CPU's share of the pool.
+	 */
+	if (len <= MCLBYTES - ETHER_ALIGN &&
+	    (m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR)) != NULL) {
+		m->m_data += ETHER_ALIGN;
+		memcpy(mtod(m, void *),
+		    (char *)frame_va + DPAA_FD_GET_OFFSET(frame), len);
+		dtsec_rm_pool_rx_recycle(sc, frame_va);
+	} else {
+		if (!dtsec_rm_rx_cpu_take(sc, frame_va))
+			return (e_RX_STORE_RESPONSE_CONTINUE);
+
+		m = m_gethdr(M_NOWAIT, MT_HEADER);
+		if (m == NULL) {
+			atomic_subtract_32(&sc->sc_rx_cpu_held, 1);
+			goto err;
+		}
+
+		m_extadd(m, frame_va, FM_PORT_BUFFER_SIZE,
+		    dtsec_rm_fqr_mext_free, frame_va, sc, 0,
+		    EXT_NET_DRV);
+		m->m_data = (char *)frame_va + DPAA_FD_GET_OFFSET(frame);
+	}
+
+	m->m_pkthdr.rcvif = sc->sc_ifnet;
+	m->m_len = len;
+	m->m_pkthdr.len = len;
+	m->m_pkthdr.csum_flags |= csum_flags;
+	m->m_pkthdr.csum_data = csum_data;
 
 	/* ether_input() counts the bytes. */
 	if_inc_counter(sc->sc_ifnet, IFCOUNTER_IPACKETS, 1);
