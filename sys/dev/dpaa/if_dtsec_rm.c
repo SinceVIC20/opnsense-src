@@ -1818,6 +1818,9 @@ dtsec_rm_if_transmit(if_t ifp, struct mbuf *m0)
 		return (ENOBUFS);
 	}
 
+	/* Let tcpdump see what is sent, as the stack only taps received frames. */
+	ETHER_BPF_MTAP(ifp, m0);
+
 	fi->fi_cpu = cpu;
 
 	fi->fi_tx_buf = NULL;
