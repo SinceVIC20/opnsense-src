@@ -92,6 +92,7 @@
 #define	FM_L3_PARSE_RESULT_IPV6	0x4000
 #define	FM_L4_PARSE_RESULT_UDP	0x40
 #define	FM_L4_PARSE_RESULT_TCP	0x20
+#define	FM_FD_STAT_L4CV		0x00000004	/* RX: parser checked the L4 checksum */
 
 struct dtsec_rm_frame_info {
 	struct mbuf			*fi_mbuf;
@@ -872,6 +873,60 @@ dtsec_rm_fqr_mext_free(struct mbuf *m)
 	atomic_subtract_32(&sc->sc_rx_cpu_held, 1);
 }
 
+/*
+ * Checksum result of a received frame from the parse result in the buffer
+ * prefix, honouring the RX checksum capabilities. Good only when the
+ * parser checked the TCP/UDP checksum and the sum came out 0xffff, as in
+ * ASK; anything else is left for the stack to verify.
+ */
+static uint32_t
+dtsec_rm_rx_csum_flags(struct dtsec_softc *sc, void *frame_va,
+    t_DpaaFD *frame, uint32_t *sum)
+{
+	t_FmPrsResult *prs;
+	uint32_t caps, flags;
+	uint16_t l3r;
+
+	*sum = 0;
+	caps = if_getcapenable(sc->sc_ifnet);
+	if (sc->sc_rx_data_offset == 0 ||
+	    (caps & (IFCAP_RXCSUM | IFCAP_RXCSUM_IPV6)) == 0)
+		return (0);
+
+	prs = FM_PORT_GetBufferPrsResult(sc->sc_rxph, (char *)frame_va);
+	if (prs == NULL)
+		return (0);
+
+	l3r = be16toh(prs->l3r);
+	if (!(((l3r & FM_L3_PARSE_RESULT_IPV4) && (caps & IFCAP_RXCSUM)) ||
+	    ((l3r & FM_L3_PARSE_RESULT_IPV6) && (caps & IFCAP_RXCSUM_IPV6))))
+		return (0);
+
+	if ((prs->l4r & (FM_L4_PARSE_RESULT_TCP | FM_L4_PARSE_RESULT_UDP)) == 0 ||
+	    (DPAA_FD_GET_STATUS(frame) & FM_FD_STAT_L4CV) == 0 ||
+	    prs->cksum != 0xffff)
+		return (0);
+
+	flags = CSUM_L3_CALC | CSUM_L3_VALID | CSUM_L4_CALC | CSUM_L4_VALID;
+	*sum = 0xffff;
+	return (flags);
+}
+
+/* The same for CDX's queues to the CPU, by the frame's pool. */
+uint32_t
+dtsec_rm_rx_csum(uint8_t bpid, void *buf, void *frame,
+    uint32_t *sum)
+{
+	struct dtsec_softc *sc;
+
+	*sum = 0;
+	sc = dtsec_bpid_map[bpid];
+	if (__predict_false(sc == NULL))
+		return (0);
+	return (dtsec_rm_rx_csum_flags(sc, buf, (t_DpaaFD *)frame,
+	    sum));
+}
+
 static uint32_t dtsec_rx_hashkey;
 
 static e_RxStoreResponse
@@ -946,58 +1001,9 @@ dtsec_rm_fqr_rx_callback(t_Handle app, t_Handle fqr, t_Handle portal,
 		}
 	}
 
-	/*
-	 * Extract RX checksum result from parse result in buffer prefix,
-	 * but only if the matching RX checksum capability is enabled -
-	 * otherwise leave csum_flags untouched so the stack verifies in
-	 * software, same as toggling the GUI checkbox off should mean.
-	 * Read before the copy below hands the buffer back.
-	 */
-	rx_csum_flags = 0;
-	rx_csum_data = 0;
-	if (sc->sc_rx_data_offset > 0 &&
-	    (if_getcapenable(sc->sc_ifnet) &
-	    (IFCAP_RXCSUM | IFCAP_RXCSUM_IPV6))) {
-		t_FmPrsResult *prs;
-
-		prs = FM_PORT_GetBufferPrsResult(sc->sc_rxph,
-		    (char *)frame_va);
-		if (prs != NULL) {
-			uint16_t l3r = be16toh(prs->l3r);
-			int cap_ok =
-			    ((l3r & FM_L3_PARSE_RESULT_IPV4) &&
-			    (if_getcapenable(sc->sc_ifnet) & IFCAP_RXCSUM)) ||
-			    ((l3r & FM_L3_PARSE_RESULT_IPV6) &&
-			    (if_getcapenable(sc->sc_ifnet) & IFCAP_RXCSUM_IPV6));
-
-			if (cap_ok) {
-				rx_csum_flags |= CSUM_L3_CALC | CSUM_L3_VALID;
-
-				if (prs->l4r & (FM_L4_PARSE_RESULT_TCP |
-				    FM_L4_PARSE_RESULT_UDP)) {
-					uint32_t fd_status =
-					    DPAA_FD_GET_STATUS(frame);
-					/*
-					 * DCL4C = "Didn't Compute L4 Checksum".
-					 * Only claim HW-verified when clear.
-					 * When set, leave flags alone so the
-					 * stack verifies L4 csum in software.
-					 *
-					 * csum_data = 0xffff: tells the stack
-					 * the full checksum (incl pseudo-hdr)
-					 * is valid. Without this, the stack
-					 * reads csum_data=0 and drops the
-					 * packet as a checksum failure.
-					 */
-					if (!(fd_status & FM_FD_CMD_DCL4C)) {
-						rx_csum_flags |=
-						    CSUM_L4_CALC | CSUM_L4_VALID;
-						rx_csum_data = 0xffff;
-					}
-				}
-			}
-		}
-	}
+	/* Read before the copy below hands the buffer back. */
+	rx_csum_flags = dtsec_rm_rx_csum_flags(sc, frame_va, frame,
+	    &rx_csum_data);
 
 	len = DPAA_FD_GET_LENGTH(frame);
 

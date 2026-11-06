@@ -245,6 +245,13 @@ void		dtsec_rm_rx_cpu_done(uint8_t bpid);
  * distribution queues to join. NULL when the port has none.
  */
 t_Handle	dtsec_rm_rx_cg(if_t ifp);
+
+/*
+ * Checksum flags for a frame of the pool @bpid, read from its parse result
+ * before the buffer is copied or freed. Sets @sum to match.
+ */
+uint32_t	dtsec_rm_rx_csum(uint8_t bpid, void *buf, void *frame,
+		    uint32_t *sum);
 /** @} */
 
 /**
