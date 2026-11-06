@@ -50,6 +50,10 @@ options 	LINUX_BOOT_ABI
 # booti skips loader(8), so RDTUN sysctls like this one can only be
 # set here. Use all 4 cores for netisr instead of the 1-thread default.
 envvar		net.isr.maxthreads="-1"
+# Hand IP and TCP for traffic the CPU handles to the netisr threads, which
+# spread it over the cores by flow hash instead of keeping it on the core
+# that received it.
+envvar		net.isr.dispatch="deferred"
 
 # Early printf for debugging
 options 	SOCDEV_PA=0x2000000
