@@ -177,7 +177,8 @@ m_ether_tcpip_hash(const uint32_t flags, const struct mbuf *m,
 		p = fnv_32_buf(&m->m_pkthdr.ether_vtag,
 		    sizeof(m->m_pkthdr.ether_vtag), p);
 	} else if (etype == ETHERTYPE_VLAN) {
-		vlan = m_common_hash_gethdr(m, off, sizeof(*vlan), &buf);
+		/* The VLAN header includes the Ethernet one, so read it from 0. */
+		vlan = m_common_hash_gethdr(m, 0, sizeof(*vlan), &buf);
 		if (vlan == NULL)
 			return (p);
 
