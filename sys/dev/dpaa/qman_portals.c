@@ -224,6 +224,7 @@ err:
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <net/if_var.h>
+#include <net/if_vlan_var.h>
 #include <net/vnet.h>
 #include <netinet/in.h>
 #include <netinet/in_pcb.h>
@@ -235,6 +236,7 @@ err:
 #include <netinet/tcp_var.h>
 #ifdef INET6
 #include <netinet6/in6_pcb.h>
+#include <netinet6/scope6_var.h>
 #endif
 
 /* Ports one core keeps an LRO table for. */
@@ -327,7 +329,7 @@ qman_rx_lro_local(struct mbuf *m)
 {
 	struct inpcb *inp;
 	struct tcphdr *th;
-	uint16_t etype;
+	uint16_t etype, vid;
 	bool csum_ok;
 	int off;
 
@@ -335,9 +337,13 @@ qman_rx_lro_local(struct mbuf *m)
 		return (0);
 	etype = ntohs(mtod(m, struct ether_header *)->ether_type);
 	off = ETHER_HDR_LEN;
+	vid = (m->m_flags & M_VLANTAG) != 0 ?
+	    EVL_VLANOFTAG(m->m_pkthdr.ether_vtag) : 0;
 	if (etype == ETHERTYPE_VLAN) {
 		if (m->m_len < sizeof(struct ether_vlan_header))
 			return (0);
+		vid = EVL_VLANOFTAG(ntohs(
+		    mtod(m, struct ether_vlan_header *)->evl_tag));
 		etype = ntohs(mtod(m, struct ether_vlan_header *)->evl_proto);
 		off = sizeof(struct ether_vlan_header);
 	}
@@ -370,7 +376,9 @@ qman_rx_lro_local(struct mbuf *m)
 #endif
 #ifdef INET6
 	case ETHERTYPE_IPV6: {
+		struct in6_addr src, dst;
 		struct ip6_hdr *ip6;
+		if_t zone;
 
 		if (m->m_len < off + sizeof(*ip6) + sizeof(*th))
 			return (0);
@@ -380,8 +388,21 @@ qman_rx_lro_local(struct mbuf *m)
 		if (!csum_ok)
 			return (-1);
 		th = (struct tcphdr *)(ip6 + 1);
-		inp = in6_pcblookup(&V_tcbinfo, &ip6->ip6_src, th->th_sport,
-		    &ip6->ip6_dst, th->th_dport, INPLOOKUP_RLOCKPCB,
+		/*
+		 * Sockets hold link-local addresses with their interface
+		 * embedded, as ip6_input() leaves them: look up copies the same
+		 * way. On a VLAN that interface is the VLAN, not the port.
+		 */
+		zone = m->m_pkthdr.rcvif;
+		if (vid != 0 && (zone = VLAN_DEVAT(zone, vid)) == NULL)
+			return (0);
+		src = ip6->ip6_src;
+		dst = ip6->ip6_dst;
+		if (in6_setscope(&src, zone, NULL) != 0 ||
+		    in6_setscope(&dst, zone, NULL) != 0)
+			return (0);
+		inp = in6_pcblookup(&V_tcbinfo, &src, th->th_sport,
+		    &dst, th->th_dport, INPLOOKUP_RLOCKPCB,
 		    m->m_pkthdr.rcvif);
 		break;
 	}
