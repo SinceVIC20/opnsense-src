@@ -234,6 +234,7 @@ err:
 #include <netinet/tcp.h>
 #include <netinet/tcp_lro.h>
 #include <netinet/tcp_var.h>
+#include <machine/in_cksum.h>
 #ifdef INET6
 #include <netinet6/in6_pcb.h>
 #include <netinet6/scope6_var.h>
@@ -254,6 +255,8 @@ static struct {
 	struct taskqueue *tq;
 	struct mbufq	rxq;		/* deferred RX mbufs */
 	struct qman_lro	*lro;		/* QMAN_LRO_IFS tables */
+	uint64_t	sw_csum;	/* segments checked in software */
+	uint64_t	sw_bad;		/* ... that failed */
 } qman_napi[MAXCPU];
 
 /*
@@ -276,6 +279,11 @@ qman_rx_lro_stat(SYSCTL_HANDLER_ARGS)
 
 	sum = 0;
 	CPU_FOREACH(cpu) {
+		if (arg2 >= 2) {
+			sum += arg2 == 2 ? qman_napi[cpu].sw_csum :
+			    qman_napi[cpu].sw_bad;
+			continue;
+		}
 		if (qman_napi[cpu].lro == NULL)
 			continue;
 		for (i = 0; i < QMAN_LRO_IFS; i++) {
@@ -293,6 +301,12 @@ SYSCTL_PROC(_hw_dpaa, OID_AUTO, rx_lro_segments,
 SYSCTL_PROC(_hw_dpaa, OID_AUTO, rx_lro_packets,
     CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 1, qman_rx_lro_stat, "QU",
     "Packets LRO passed up after merging");
+SYSCTL_PROC(_hw_dpaa, OID_AUTO, rx_lro_sw_csum,
+    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 2, qman_rx_lro_stat, "QU",
+    "Segments of local connections checksummed in software for LRO");
+SYSCTL_PROC(_hw_dpaa, OID_AUTO, rx_lro_sw_bad,
+    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 3, qman_rx_lro_stat, "QU",
+    "Of those, segments with a bad checksum (left to the stack)");
 
 /* This core's LRO table for @ifp, made on first use; NULL if none. */
 static struct lro_ctrl *
@@ -319,19 +333,43 @@ qman_rx_lro_ctrl(int cpu, if_t ifp, int *idx)
 }
 
 /*
- * 1 when @m is a TCP segment, checksum checked by the hardware, of a
- * connection on this box (exact match, so port forwards never qualify);
- * -1 when it is TCP whose checksum the hardware did not pass, so what LRO
- * holds goes up first and the order stays; 0 otherwise.
+ * TCP checksum of the segment at @l4off, @tlen bytes long, checked in
+ * software, for when the hardware result is not used.
+ */
+static bool
+qman_rx_tcp_csum(struct mbuf *m, int l4off, int tlen, void *l3, bool v6)
+{
+	struct ip *ip;
+	uint16_t sum;
+
+	if (m->m_pkthdr.len < l4off + tlen)
+		return (false);
+	sum = ~in_cksum_skip(m, l4off + tlen, l4off) & 0xffff;
+#ifdef INET6
+	if (v6)
+		return (in6_cksum_pseudo(l3, tlen, IPPROTO_TCP, sum) == 0xffff);
+#endif
+	ip = l3;
+	return (in_pseudo(ip->ip_src.s_addr, ip->ip_dst.s_addr,
+	    htonl(sum + tlen + IPPROTO_TCP)) == 0xffff);
+}
+
+/*
+ * 1 when @m is a TCP segment with a good checksum of a connection on this
+ * box (exact match, so port forwards never qualify); -1 when it is TCP that
+ * cannot be merged, so what LRO holds goes up first and the order stays;
+ * 0 otherwise. Without a hardware result, local segments are checked in
+ * software.
  */
 static int
-qman_rx_lro_local(struct mbuf *m)
+qman_rx_lro_local(struct mbuf *m, int cpu)
 {
 	struct inpcb *inp;
 	struct tcphdr *th;
+	void *l3;
 	uint16_t etype, vid;
-	bool csum_ok;
-	int off;
+	bool csum_ok, v6;
+	int off, tlen;
 
 	if (m->m_len < ETHER_HDR_LEN)
 		return (0);
@@ -362,11 +400,12 @@ qman_rx_lro_local(struct mbuf *m)
 		ip = (struct ip *)(mtod(m, char *) + off);
 		if (ip->ip_p != IPPROTO_TCP)
 			return (0);
-		if (!csum_ok)
-			return (-1);
 		if (ip->ip_hl != sizeof(*ip) >> 2 ||
 		    (ip->ip_off & htons(IP_MF | IP_OFFMASK)) != 0)
-			return (0);
+			return (csum_ok ? 0 : -1);
+		l3 = ip;
+		v6 = false;
+		tlen = ntohs(ip->ip_len) - (int)sizeof(*ip);
 		th = (struct tcphdr *)(ip + 1);
 		inp = in_pcblookup(&V_tcbinfo, ip->ip_src, th->th_sport,
 		    ip->ip_dst, th->th_dport, INPLOOKUP_RLOCKPCB,
@@ -385,8 +424,9 @@ qman_rx_lro_local(struct mbuf *m)
 		ip6 = (struct ip6_hdr *)(mtod(m, char *) + off);
 		if (ip6->ip6_nxt != IPPROTO_TCP)
 			return (0);
-		if (!csum_ok)
-			return (-1);
+		l3 = ip6;
+		v6 = true;
+		tlen = ntohs(ip6->ip6_plen);
 		th = (struct tcphdr *)(ip6 + 1);
 		/*
 		 * Sockets hold link-local addresses with their interface
@@ -400,7 +440,7 @@ qman_rx_lro_local(struct mbuf *m)
 		dst = ip6->ip6_dst;
 		if (in6_setscope(&src, zone, NULL) != 0 ||
 		    in6_setscope(&dst, zone, NULL) != 0)
-			return (0);
+			return (csum_ok ? 0 : -1);
 		inp = in6_pcblookup(&V_tcbinfo, &src, th->th_sport,
 		    &dst, th->th_dport, INPLOOKUP_RLOCKPCB,
 		    m->m_pkthdr.rcvif);
@@ -411,8 +451,20 @@ qman_rx_lro_local(struct mbuf *m)
 		return (0);
 	}
 	if (inp == NULL)
-		return (0);
+		return (csum_ok ? 0 : -1);
 	INP_RUNLOCK(inp);
+	if (csum_ok)
+		return (1);
+
+	/* Only the hardware result was missing: check it here. */
+	qman_napi[cpu].sw_csum++;
+	if (tlen < (int)sizeof(*th) ||
+	    !qman_rx_tcp_csum(m, (char *)th - mtod(m, char *), tlen, l3, v6)) {
+		qman_napi[cpu].sw_bad++;
+		return (-1);
+	}
+	m->m_pkthdr.csum_flags |= CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
+	m->m_pkthdr.csum_data = 0xffff;
 	return (1);
 }
 
@@ -486,7 +538,7 @@ qman_portal_poll_task(void *arg, int pending)
 		if (lro && (lc = qman_rx_lro_ctrl(cpu, m->m_pkthdr.rcvif,
 		    &i)) != NULL) {
 			CURVNET_SET(if_getvnet(lc->ifp));
-			ok = qman_rx_lro_local(m);
+			ok = qman_rx_lro_local(m, cpu);
 			CURVNET_RESTORE();
 			if (ok == 1 && tcp_lro_rx_local(lc, m, 0) == 0) {
 				held |= 1u << i;
