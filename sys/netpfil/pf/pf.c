@@ -2733,7 +2733,13 @@ pf_purge_thread(void *unused __unused)
 				 */
 				pf_purge_expired_fragments();
 				pf_purge_expired_src_nodes();
+				/*
+				 * Takes the config lock, and may have to
+				 * sleep for it.
+				 */
+				NET_EPOCH_EXIT(et);
 				pf_purge_unlinked_rules();
+				NET_EPOCH_ENTER(et);
 				pfi_kkif_purge();
 			}
 			CURVNET_RESTORE();
@@ -2750,6 +2756,9 @@ pf_purge_thread(void *unused __unused)
 void
 pf_unload_vnet_purge(void)
 {
+
+	/* Overload entries reference rules: apply them before rules are freed. */
+	taskqueue_drain(taskqueue_swi, &V_pf_overloadtask);
 
 	/*
 	 * To cleanse up all kifs and rules we need
@@ -2958,6 +2967,14 @@ pf_free_state(struct pf_kstate *cur)
 	pf_counter_u64_add(&V_pf_status.fcounters[FCNT_STATE_REMOVALS], 1);
 }
 
+static inline void
+pf_kkif_mark(struct pfi_kkif *kif)
+{
+
+	if ((atomic_load_int(&kif->pfik_flags) & PFI_IFLAG_REFS) == 0)
+		atomic_set_int(&kif->pfik_flags, PFI_IFLAG_REFS);
+}
+
 /*
  * Called only from pf_purge_thread(), thus serialized.
  */
@@ -2993,11 +3010,11 @@ relock:
 					s->nat_rule->rule_ref |= PFRULE_REFS;
 				if (s->anchor != NULL)
 					s->anchor->rule_ref |= PFRULE_REFS;
-				s->kif->pfik_flags |= PFI_IFLAG_REFS;
+				pf_kkif_mark(s->kif);
 				SLIST_FOREACH(mrm, &s->match_rules, entry)
 					mrm->r->rule_ref |= PFRULE_REFS;
 				if (s->act.rt_kif)
-					s->act.rt_kif->pfik_flags |= PFI_IFLAG_REFS;
+					pf_kkif_mark(s->act.rt_kif);
 				count++;
 			}
 			PF_HASHROW_UNLOCK(ih);
@@ -6859,8 +6876,12 @@ pf_tcp_track_full(struct pf_kstate *state, struct pf_pdesc *pd,
 	    (ackskew <= (MAXACKWINDOW << sws)) &&
 	    /* Acking not more than one window forward */
 	    ((tcp_get_flags(th) & TH_RST) == 0 || orig_seq == src->seqlo ||
-	    (orig_seq == src->seqlo + 1) || (orig_seq + 1 == src->seqlo))) {
+	    (orig_seq == src->seqlo + 1) || (orig_seq + 1 == src->seqlo) ||
 	    /* Require an exact/+1 sequence match on resets when possible */
+	    (SEQ_GEQ(orig_seq, src->seqlo - (dst->max_win << dws)) &&
+	    SEQ_LEQ(orig_seq, src->seqlo + 1) && ackskew == 0 &&
+	    (th->th_flags & (TH_ACK|TH_RST)) == (TH_ACK|TH_RST)))) {
+		/* Allow resets to match sequence window if ack is perfect match */
 
 		if (dst->scrub || src->scrub) {
 			if (pf_normalize_tcp_stateful(pd, reason, th,
@@ -8118,9 +8139,21 @@ pf_test_state_icmp(struct pf_kstate **state, struct pf_pdesc *pd,
 					    &pd->hdr.icmp6.icmp6_cksum,
 					    &nk->addr[didx], 0);
 
-				if (nk->port[iidx] != pd->hdr.icmp6.icmp6_id)
+				/*
+				 * Only echo has an identifier.  Other
+				 * types use a virtual id of 0 and keep
+				 * other fields here (e.g. the NA flags).
+				 */
+				if (virtual_type == htons(ICMP6_ECHO_REQUEST) &&
+				    nk->port[iidx] != pd->hdr.icmp6.icmp6_id) {
+					pd->hdr.icmp6.icmp6_cksum =
+					    pf_cksum_fixup(
+					    pd->hdr.icmp6.icmp6_cksum,
+					    pd->hdr.icmp6.icmp6_id,
+					    nk->port[iidx], 0);
 					pd->hdr.icmp6.icmp6_id =
 					    nk->port[iidx];
+				}
 
 				m_copyback(pd->m, pd->off, sizeof(struct icmp6_hdr),
 				    (caddr_t )&pd->hdr.icmp6);
@@ -9411,6 +9444,21 @@ pf_route(struct pf_krule *r, struct ifnet *oifp,
 	}
 
 	/*
+	 * If the output interface does not accept unmapped mbufs, convert
+	 * them to mapped mbufs.
+	 */
+	if ((ifp->if_capenable & IFCAP_MEXTPG) == 0) {
+		error = mb_unmapped_to_ext(m0, &md);
+		if (error)
+			goto done;
+		/*
+		 * The first mbuf should not be reallocated because it is
+		 * always mapped.
+		 */
+		MPASS(m0 == md);
+	}
+
+	/*
 	 * If small enough for interface, or the interface will take
 	 * care of the fragmentation for us, we can just send directly.
 	 */
@@ -9767,6 +9815,11 @@ pf_route6(struct pf_krule *r, struct ifnet *oifp,
 	}
 
 	if ((u_long)m0->m_pkthdr.len <= ifp->if_mtu) {
+		if ((ifp->if_capenable & IFCAP_MEXTPG) == 0) {
+			if (mb_unmapped_to_ext(m0, &md) != 0)
+				goto done;
+			MPASS(m0 == md);
+		}
 		md = m0;
 		pf_dummynet_route(pd, s, r, ifp, sintosa(&dst), &md);
 		if (md != NULL) {
@@ -10186,7 +10239,7 @@ static int
 pf_walk_header(struct pf_pdesc *pd, struct ip *h, u_short *reason)
 {
 	struct ah	 ext;
-	u_int32_t	 hlen, end;
+	u_int32_t	 hlen, end, extlen;
 	int		 hdr_cnt;
 
 	hlen = h->ip_hl << 2;
@@ -10234,7 +10287,16 @@ pf_walk_header(struct pf_pdesc *pd, struct ip *h, u_short *reason)
 				DPFPRINTF(PF_DEBUG_MISC, "IP short exthdr");
 				return (PF_DROP);
 			}
-			pd->off += (ext.ah_len + 2) * 4;
+			extlen = (ext.ah_len + 2) * 4;
+			if (end < pd->off + extlen) {
+				if ((h->ip_off & htons(IP_MF | IP_OFFMASK))
+				    != 0)
+					return (PF_PASS);
+				DPFPRINTF(PF_DEBUG_MISC, "IP long exthdr");
+				REASON_SET(reason, PFRES_SHORT);
+				return (PF_DROP);
+			}
+			pd->off += extlen;
 			pd->proto = ext.ah_nxt;
 			break;
 		default:
@@ -10323,7 +10385,7 @@ pf_walk_header6(struct pf_pdesc *pd, struct ip6_hdr *h, u_short *reason)
 	struct ip6_ext		 ext;
 	struct icmp6_hdr	 icmp6;
 	struct ip6_rthdr	 rthdr;
-	uint32_t		 end;
+	uint32_t		 end, extlen;
 	int			 hdr_cnt, fraghdr_cnt = 0, rthdr_cnt = 0;
 
 	pd->off += sizeof(struct ip6_hdr);
@@ -10434,9 +10496,20 @@ pf_walk_header6(struct pf_pdesc *pd, struct ip6_hdr *h, u_short *reason)
 				return (PF_DROP);
 			}
 			if (pd->proto == IPPROTO_AH)
-				pd->off += (ext.ip6e_len + 2) * 4;
+				extlen = (ext.ip6e_len + 2) * 4;
 			else
-				pd->off += (ext.ip6e_len + 1) * 8;
+				extlen = (ext.ip6e_len + 1) * 8;
+			if (end < pd->off + extlen) {
+				if (pd->fragoff != 0) {
+					pd->off = pd->fragoff;
+					pd->proto = IPPROTO_FRAGMENT;
+					return (PF_PASS);
+				}
+				DPFPRINTF(PF_DEBUG_MISC, "IPv6 long exthdr");
+				REASON_SET(reason, PFRES_SHORT);
+				return (PF_DROP);
+			}
+			pd->off += extlen;
 			pd->proto = ext.ip6e_nxt;
 			break;
 		case IPPROTO_ICMPV6:
@@ -11004,6 +11077,7 @@ pf_test(sa_family_t af, int dir, int pflags, struct ifnet *ifp, struct mbuf **m0
 {
 	struct pfi_kkif		*kif;
 	u_short			 action, reason = 0;
+	struct mbuf		*m;
 	struct m_tag		*mtag;
 	struct pf_krule		*a = NULL, *r = &V_pf_default_rule;
 	struct pf_kstate	*s = NULL;
@@ -11052,6 +11126,12 @@ pf_test(sa_family_t af, int dir, int pflags, struct ifnet *ifp, struct mbuf **m0
 	}
 
 	if (__predict_false(! M_WRITABLE(*m0))) {
+		/* Need to convert unmapped mbufs before calling m_unshare(). */
+		if (mb_unmapped_to_ext(*m0, &m) != 0) {
+			*m0 = NULL;
+			return (PF_DROP);
+		}
+		MPASS(*m0 == m);
 		*m0 = m_unshare(*m0, M_NOWAIT);
 		if (*m0 == NULL) {
 			return (PF_DROP);
@@ -11071,6 +11151,14 @@ pf_test(sa_family_t af, int dir, int pflags, struct ifnet *ifp, struct mbuf **m0
 			*m0 = NULL;
 			return (PF_PASS);
 		}
+
+		/*
+		 * No need to call mb_unmapped_to_ext() here because it had
+		 * already been called in pf_route()/pf_route6() and dummynet
+		 * re-injected this packet.
+		 */
+
+		M_ASSERTMAPPED(*m0);
 		(ifp->if_output)(ifp, *m0, sintosa(&pd.pf_mtag->dst), NULL);
 		*m0 = NULL;
 		return (PF_PASS);

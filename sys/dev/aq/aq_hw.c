@@ -32,15 +32,15 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <unistd.h>
-#include <sys/endian.h>
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <machine/cpu.h>
+#include <sys/endian.h>
 #include <sys/socket.h>
-#include <net/if.h>
+#include <machine/cpu.h>
+#include <net/rss_config.h>
 
 #include "aq_hw.h"
+#include "aq2_hw.h"
 #include "aq_dbg.h"
 #include "aq_hw_llh.h"
 #include "aq_fw.h"
@@ -48,701 +48,928 @@
 #define AQ_HW_FW_SM_RAM        0x2U
 #define AQ_CFG_FW_MIN_VER_EXPECTED 0x01050006U
 
+static uint32_t aq_hw_active_tcs(struct aq_hw *hw);
 
-int aq_hw_err_from_flags(struct aq_hw *hw)
+int
+aq_hw_err_from_flags(struct aq_hw *hw)
 {
-    return (0);
+	if (atomic_load_acq_long(&hw->flags) & AQ_HW_FLAG_ERR_UNPLUG)
+		return (ENXIO);
+	return (0);
 }
 
-static void aq_hw_chip_features_init(struct aq_hw *hw, u32 *p)
+int
+aq_hw_invalidate_descriptor_cache(struct aq_hw *hw)
 {
-    u32 chip_features = 0U;
-    u32 val = reg_glb_mif_id_get(hw);
-    u32 mif_rev = val & 0xFFU;
+	int error;
 
-    if ((0xFU & mif_rev) == 1U) {
-        chip_features |= AQ_HW_CHIP_REVISION_A0 |
-                 AQ_HW_CHIP_MPI_AQ |
-                 AQ_HW_CHIP_MIPS;
-    } else if ((0xFU & mif_rev) == 2U) {
-        chip_features |= AQ_HW_CHIP_REVISION_B0 |
-                 AQ_HW_CHIP_MPI_AQ |
-                 AQ_HW_CHIP_MIPS |
-                 AQ_HW_CHIP_TPO2 |
-                 AQ_HW_CHIP_RPF2;
-    } else if ((0xFU & mif_rev) == 0xAU) {
-        chip_features |= AQ_HW_CHIP_REVISION_B1 |
-                 AQ_HW_CHIP_MPI_AQ |
-                 AQ_HW_CHIP_MIPS |
-                 AQ_HW_CHIP_TPO2 |
-                 AQ_HW_CHIP_RPF2;
-    }
+	/* Atlantic A0 does not implement this stop workaround. */
+	if (IS_CHIP_FEATURE(hw, REVISION_A0))
+		return (0);
 
-    *p = chip_features;
+	/*
+	 * Cached Rx descriptors retain both descriptor and data addresses.
+	 * Toggle the global cache invalidation only after every ring is down.
+	 */
+	rdm_rx_dma_desc_cache_init_tgl(hw);
+	error = aq_hw_err_from_flags(hw);
+	if (error != 0)
+		return (error);
+
+	error = AQ_HW_WAIT_FOR(rdm_rx_dma_desc_cache_init_done_get(hw) != 0,
+	    1000, 10);
+	if (error != 0)
+		return (error);
+	return (aq_hw_err_from_flags(hw));
 }
 
-int aq_hw_fw_downld_dwords(struct aq_hw *hw, u32 a, u32 *p, u32 cnt)
+inline uint32_t
+aq_hw_read_reg(struct aq_hw *hw, uint32_t reg)
 {
-    int err = 0;
+	uint32_t val = le32toh(bus_space_read_4(hw->hw_tag, hw->hw_handle, reg));
 
-//    AQ_DBG_ENTER();
-    AQ_HW_WAIT_FOR(reg_glb_cpu_sem_get(hw,
-                       AQ_HW_FW_SM_RAM) == 1U,
-                       1U, 10000U);
+	if (__predict_false(val == 0xFFFFFFFFU) &&
+	    le32toh(bus_space_read_4(hw->hw_tag, hw->hw_handle, 0x10)) ==
+	    0xFFFFFFFFU)
+		atomic_set_rel_long(&hw->flags, AQ_HW_FLAG_ERR_UNPLUG);
 
-    if (err < 0) {
-        bool is_locked;
+	return (val);
+}
 
-        reg_glb_cpu_sem_set(hw, 1U, AQ_HW_FW_SM_RAM);
-        is_locked = reg_glb_cpu_sem_get(hw, AQ_HW_FW_SM_RAM);
-        if (!is_locked) {
-            err = -ETIME;
-            goto err_exit;
-        }
-    }
+static void
+aq_hw_chip_features_init(struct aq_hw *hw, uint32_t *p)
+{
+	uint32_t chip_features = 0U;
+	uint32_t val = reg_glb_mif_id_get(hw);
+	uint32_t mif_rev = val & 0xFFU;
 
-    mif_mcp_up_mailbox_addr_set(hw, a);
+	if ((0xFU & mif_rev) == 1U) {
+		chip_features |= AQ_HW_CHIP_REVISION_A0 | AQ_HW_CHIP_MPI_AQ |
+		     AQ_HW_CHIP_MIPS;
+	} else if ((0xFU & mif_rev) == 2U) {
+		chip_features |= AQ_HW_CHIP_REVISION_B0 | AQ_HW_CHIP_MPI_AQ |
+		    AQ_HW_CHIP_MIPS | AQ_HW_CHIP_TPO2 | AQ_HW_CHIP_RPF2;
+	} else if ((0xFU & mif_rev) == 0xAU) {
+		chip_features |= AQ_HW_CHIP_REVISION_B1 | AQ_HW_CHIP_MPI_AQ |
+		    AQ_HW_CHIP_MIPS | AQ_HW_CHIP_TPO2 | AQ_HW_CHIP_RPF2;
+	}
 
-    for (++cnt; --cnt && !err;) {
-        mif_mcp_up_mailbox_execute_operation_set(hw, 1);
+	*p = chip_features;
+}
 
-        if (IS_CHIP_FEATURE(hw, REVISION_B1))
-            AQ_HW_WAIT_FOR(a != mif_mcp_up_mailbox_addr_get(hw), 1U, 1000U);
-        else
-            AQ_HW_WAIT_FOR(!mif_mcp_up_mailbox_busy_get(hw), 1, 1000U);
+int
+aq_hw_fw_downld_dwords(struct aq_hw *hw, uint32_t a, uint32_t *p, uint32_t cnt)
+{
+	int err = 0;
 
-        *(p++) = mif_mcp_up_mailbox_data_get(hw);
-    }
+	err = AQ_HW_WAIT_FOR(reg_glb_cpu_sem_get(hw, AQ_HW_FW_SM_RAM) == 1U, 1U,
+	     10000U);
 
-    reg_glb_cpu_sem_set(hw, 1U, AQ_HW_FW_SM_RAM);
+	if (err != 0) {
+		bool is_locked;
+
+		reg_glb_cpu_sem_set(hw, 1U, AQ_HW_FW_SM_RAM);
+		is_locked = reg_glb_cpu_sem_get(hw, AQ_HW_FW_SM_RAM);
+		if (!is_locked) {
+			err = ETIMEDOUT;
+			goto err_exit;
+		}
+		err = 0;
+	}
+
+	mif_mcp_up_mailbox_addr_set(hw, a);
+
+	for (++cnt; --cnt && !err;) {
+		mif_mcp_up_mailbox_execute_operation_set(hw, 1);
+
+		if (IS_CHIP_FEATURE(hw, REVISION_B1))
+			err = AQ_HW_WAIT_FOR(a != mif_mcp_up_mailbox_addr_get(hw),
+			    1U, 1000U);
+		else
+			err = AQ_HW_WAIT_FOR(!mif_mcp_up_mailbox_busy_get(hw), 1,
+			     1000U);
+
+		*(p++) = mif_mcp_up_mailbox_data_get(hw);
+		a += 4;
+	}
+
+	reg_glb_cpu_sem_set(hw, 1U, AQ_HW_FW_SM_RAM);
 
 err_exit:
-//    AQ_DBG_EXIT(err);
-    return (err);
+	return (err);
 }
 
-int aq_hw_ver_match(const aq_hw_fw_version* ver_expected, const aq_hw_fw_version* ver_actual)
+int
+aq_hw_ver_match(const struct aq_hw_fw_version* ver_expected,
+    const struct aq_hw_fw_version* ver_actual)
 {
-    AQ_DBG_ENTER();
+	AQ_DBG_ENTER();
 
-    if (ver_actual->major_version >= ver_expected->major_version)
-        return (true);
-    if (ver_actual->minor_version >= ver_expected->minor_version)
-        return (true);
-    if (ver_actual->build_number >= ver_expected->build_number)
-        return (true);
-
-    return (false);
+	if (ver_actual->major_version != ver_expected->major_version)
+		return (ver_actual->major_version > ver_expected->major_version);
+	if (ver_actual->minor_version != ver_expected->minor_version)
+		return (ver_actual->minor_version > ver_expected->minor_version);
+	return (ver_actual->build_number >= ver_expected->build_number);
 }
 
-static int aq_hw_init_ucp(struct aq_hw *hw)
+static int
+aq_hw_init_ucp(struct aq_hw *hw)
 {
-    int err = 0;
-    AQ_DBG_ENTER();
+	int err = 0;
+	AQ_DBG_ENTER();
 
-    hw->fw_version.raw = 0;
+	hw->fw_version.raw = 0;
 
-    err = aq_fw_reset(hw);
-    if (err != EOK) {
-        aq_log_error("aq_hw_init_ucp(): F/W reset failed, err %d", err);
-        return (err);
-    }
+	/* Atlantic 2 uses a different reset/firmware handshake. */
+	if (IS_CHIP_FEATURE(hw, ATLANTIC2))
+		return (aq2_fw_reboot(hw));
 
-    aq_hw_chip_features_init(hw, &hw->chip_features);
-    err = aq_fw_ops_init(hw);
-    if (err < 0) {
-        aq_log_error("could not initialize F/W ops, err %d", err);
-        return (-1);
-    }
+	err = aq_fw_reset(hw);
+	if (err != 0) {
+		device_printf(hw->dev, "aq_hw_init_ucp(): F/W reset failed, err %d\n", err);
+		return (err);
+	}
 
-    if (hw->fw_version.major_version == 1) {
-        if (!AQ_READ_REG(hw, 0x370)) {
-            unsigned int rnd = 0;
-            unsigned int ucp_0x370 = 0;
+	aq_hw_chip_features_init(hw, &hw->chip_features);
+	err = aq_fw_ops_init(hw);
+	if (err != 0) {
+		device_printf(hw->dev, "could not initialize F/W ops, err %d\n", err);
+		return (err);
+	}
 
-            rnd = arc4random();
+	if (hw->fw_version.major_version == 1) {
+		if (!AQ_READ_REG(hw, 0x370)) {
+			unsigned int rnd = 0;
+			unsigned int ucp_0x370 = 0;
 
-            ucp_0x370 = 0x02020202 | (0xFEFEFEFE & rnd);
-            AQ_WRITE_REG(hw, AQ_HW_UCP_0X370_REG, ucp_0x370);
-        }
+			rnd = arc4random();
 
-        reg_glb_cpu_scratch_scp_set(hw, 0, 25);
-    }
+			ucp_0x370 = 0x02020202 | (0xFEFEFEFE & rnd);
+			AQ_WRITE_REG(hw, AQ_HW_UCP_0X370_REG, ucp_0x370);
+		}
 
-    /* check 10 times by 1ms */
-    AQ_HW_WAIT_FOR((hw->mbox_addr = AQ_READ_REG(hw, 0x360)) != 0, 400U, 20);
+		reg_glb_cpu_scratch_scp_set(hw, 0, 25);
+	}
 
-    aq_hw_fw_version ver_expected = { .raw = AQ_CFG_FW_MIN_VER_EXPECTED };
-    if (!aq_hw_ver_match(&ver_expected, &hw->fw_version))
-        aq_log_error("atlantic: aq_hw_init_ucp(), wrong FW version: expected:%x actual:%x",
-              AQ_CFG_FW_MIN_VER_EXPECTED, hw->fw_version.raw);
+	/* check 10 times by 1ms */
+	err = AQ_HW_WAIT_FOR((hw->mbox_addr = AQ_READ_REG(hw, 0x360)) != 0, 400U, 20);
 
-    AQ_DBG_EXIT(err);
-    return (err);
+	struct aq_hw_fw_version ver_expected = { .raw = AQ_CFG_FW_MIN_VER_EXPECTED };
+	if (!aq_hw_ver_match(&ver_expected, &hw->fw_version))
+	        device_printf(hw->dev, "aq_hw_init_ucp(), wrong FW version: expected:%x actual:%x\n",
+		    AQ_CFG_FW_MIN_VER_EXPECTED, hw->fw_version.raw);
+
+	AQ_DBG_EXIT(err);
+	return (err);
 }
 
-int aq_hw_mpi_create(struct aq_hw *hw)
+int
+aq_hw_mpi_create(struct aq_hw *hw)
 {
-    int err = 0;
+	int err = 0;
 
-    AQ_DBG_ENTER();
-    err = aq_hw_init_ucp(hw);
-    if (err < 0)
-        goto err_exit;
+	AQ_DBG_ENTER();
+	err = aq_hw_init_ucp(hw);
+	if (err != 0)
+		goto err_exit;
 
 err_exit:
-    AQ_DBG_EXIT(err);
-    return (err);
+	AQ_DBG_EXIT(err);
+	return (err);
 }
 
-int aq_hw_mpi_read_stats(struct aq_hw *hw, struct aq_hw_fw_mbox *pmbox)
+int
+aq_hw_mpi_read_stats(struct aq_hw *hw, struct aq_hw_stats *stats)
 {
-    int err = 0;
-//    AQ_DBG_ENTER();
+	int err;
 
-    if (hw->fw_ops && hw->fw_ops->get_stats) {
-        err = hw->fw_ops->get_stats(hw, &pmbox->stats);
-    } else {
-        err = -ENOTSUP;
-        aq_log_error("get_stats() not supported by F/W");
-    }
+	err = hw->fw_ops->get_stats(hw, stats);
+	if (err != 0)
+		return (err);
 
-    if (err == EOK) {
-        pmbox->stats.dpc = reg_rx_dma_stat_counter7get(hw);
-        pmbox->stats.cprc = stats_rx_lro_coalesced_pkt_count0_get(hw);
-    }
+	/* No firmware interface reports the RPB drop count; read it directly. */
+	stats->dpc = reg_rx_dma_stat_counter7get(hw);
 
-//    AQ_DBG_EXIT(err);
-    return (err);
+	/* The LRO counter has no A2 counterpart in any reference driver. */
+	if (!IS_CHIP_FEATURE(hw, ATLANTIC2))
+		stats->cprc = stats_rx_lro_coalesced_pkt_count0_get(hw);
+
+	return (0);
 }
 
-static int aq_hw_mpi_set(struct aq_hw *hw,
-              enum aq_hw_fw_mpi_state_e state, u32 speed)
+static int
+aq_hw_mpi_set(struct aq_hw *hw, enum aq_hw_fw_mpi_state state, uint32_t speed)
 {
-    int err = -ENOTSUP;
-    AQ_DBG_ENTERA("speed %d", speed);
+	int err;
+	AQ_DBG_ENTERA("speed %d", speed);
 
-    if (hw->fw_ops && hw->fw_ops->set_mode) {
-        err = hw->fw_ops->set_mode(hw, state, speed);
-    } else {
-        aq_log_error("set_mode() not supported by F/W");
-    }
+	err = hw->fw_ops->set_mode(hw, state, speed);
 
-    AQ_DBG_EXIT(err);
-    return (err);
+	AQ_DBG_EXIT(err);
+	return (err);
 }
 
-int aq_hw_set_link_speed(struct aq_hw *hw, u32 speed)
+int
+aq_hw_set_link_speed(struct aq_hw *hw, uint32_t speed)
 {
-    return aq_hw_mpi_set(hw, MPI_INIT, speed);
+	return aq_hw_mpi_set(hw, MPI_INIT, speed);
 }
 
-int aq_hw_get_link_state(struct aq_hw *hw, u32 *link_speed, struct aq_hw_fc_info *fc_neg)
+int
+aq_hw_get_link_state(struct aq_hw *hw, uint32_t *link_speed, struct aq_hw_fc_info *fc_neg)
 {
-    int err = EOK;
+	int err = 0;
 
- //   AQ_DBG_ENTER();
 
-    enum aq_hw_fw_mpi_state_e mode;
-    aq_fw_link_speed_t speed = aq_fw_none;
-    aq_fw_link_fc_t fc;
+	enum aq_hw_fw_mpi_state mode;
+	enum aq_fw_link_speed speed = aq_fw_none;
+	enum aq_fw_link_fc fc;
 
-    if (hw->fw_ops && hw->fw_ops->get_mode) {
-        err = hw->fw_ops->get_mode(hw, &mode, &speed, &fc);
-    } else {
-        aq_log_error("get_mode() not supported by F/W");
-		AQ_DBG_EXIT(-ENOTSUP);
-        return (-ENOTSUP);
-    }
-
-    if (err < 0) {
-        aq_log_error("get_mode() failed, err %d", err);
-		AQ_DBG_EXIT(err);
-        return (err);
-    }
 	*link_speed = 0;
-    if (mode != MPI_INIT)
-        return (0);
+	fc_neg->fc_rx = false;
+	fc_neg->fc_tx = false;
 
-    switch (speed) {
-    case aq_fw_10G:
-        *link_speed = 10000U;
-        break;
+	err = hw->fw_ops->get_mode(hw, &mode, &speed, &fc);
 
-    case aq_fw_5G:
-        *link_speed = 5000U;
-        break;
+	if (err != 0) {
+		device_printf(hw->dev, "get_mode() failed, err %d\n", err);
+		AQ_DBG_EXIT(err);
+		return (err);
+	}
+	if (mode != MPI_INIT)
+		return (0);
 
-    case aq_fw_2G5:
-        *link_speed = 2500U;
-        break;
+	hw->link_speed = speed;	/* remember negotiated rate for interrupt moderation */
 
-    case aq_fw_1G:
-        *link_speed = 1000U;
-        break;
+	switch (speed) {
+	case aq_fw_10G:
+		*link_speed = 10000U;
+		break;
+	case aq_fw_5G:
+		*link_speed = 5000U;
+		break;
+	case aq_fw_2G5:
+		*link_speed = 2500U;
+		break;
+	case aq_fw_1G:
+		*link_speed = 1000U;
+		break;
+	case aq_fw_100M:
+		*link_speed = 100U;
+		break;
+	case aq_fw_10M:
+		*link_speed = 10U;
+		break;
+	default:
+		*link_speed = 0U;
+		break;
+	}
 
-    case aq_fw_100M:
-        *link_speed = 100U;
-        break;
+	fc_neg->fc_rx = !!(fc & aq_fw_fc_ENABLE_RX);
+	fc_neg->fc_tx = !!(fc & aq_fw_fc_ENABLE_TX);
 
-    default:
-        *link_speed = 0U;
-        break;
-    }
-
-    fc_neg->fc_rx = !!(fc & aq_fw_fc_ENABLE_RX);
-    fc_neg->fc_tx = !!(fc & aq_fw_fc_ENABLE_TX);
-
- //   AQ_DBG_EXIT(0);
-    return (0);
+	return (0);
 }
 
-int aq_hw_get_mac_permanent(struct aq_hw *hw,  u8 *mac)
+int
+aq_hw_get_mac_permanent(struct aq_hw *hw,  uint8_t *mac)
 {
-    int err = -ENOTSUP;
-    AQ_DBG_ENTER();
+	int err;
+	AQ_DBG_ENTER();
 
-    if (hw->fw_ops && hw->fw_ops->get_mac_addr)
-        err = hw->fw_ops->get_mac_addr(hw, mac);
+	err = hw->fw_ops->get_mac_addr(hw, mac);
+	if (err != 0) {
+		/* A transient mailbox failure must not fail the attach. */
+		device_printf(hw->dev, "could not read the MAC address: %d\n",
+		    err);
+		memset(mac, 0, ETHER_ADDR_LEN);
+	}
 
-    /* Couldn't get MAC address from HW. Use auto-generated one. */
-    if ((mac[0] & 1) || ((mac[0] | mac[1] | mac[2]) == 0)) {
-        u16 rnd;
-        u32 h = 0;
-        u32 l = 0;
+	/* Couldn't get MAC address from HW. Use auto-generated one. */
+	if ((mac[0] & 1) || ((mac[0] | mac[1] | mac[2]) == 0)) {
+		uint16_t rnd;
+		uint32_t h = 0;
+		uint32_t l = 0;
 
-        printf("atlantic: HW MAC address %x:%x:%x:%x:%x:%x is multicast or empty MAC", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-        printf("atlantic: Use random MAC address");
+		device_printf(hw->dev,
+		    "invalid (multicast/empty) HW MAC %6D; using random\n",
+		    mac, ":");
 
-        rnd = arc4random();
+		rnd = arc4random();
 
-        /* chip revision */
-        l = 0xE3000000U
-            | (0xFFFFU & rnd)
-            | (0x00 << 16);
-        h = 0x8001300EU;
+		/* chip revision */
+		l = 0xE3000000U | (0xFFFFU & rnd) | (0x00 << 16);
+		h = 0x8001300EU;
 
-        mac[5] = (u8)(0xFFU & l);
-        l >>= 8;
-        mac[4] = (u8)(0xFFU & l);
-        l >>= 8;
-        mac[3] = (u8)(0xFFU & l);
-        l >>= 8;
-        mac[2] = (u8)(0xFFU & l);
-        mac[1] = (u8)(0xFFU & h);
-        h >>= 8;
-        mac[0] = (u8)(0xFFU & h);
+		mac[5] = (uint8_t)(0xFFU & l);
+		l >>= 8;
+		mac[4] = (uint8_t)(0xFFU & l);
+		l >>= 8;
+		mac[3] = (uint8_t)(0xFFU & l);
+		l >>= 8;
+		mac[2] = (uint8_t)(0xFFU & l);
+		mac[1] = (uint8_t)(0xFFU & h);
+		h >>= 8;
+		mac[0] = (uint8_t)(0xFFU & h);
 
-        err = EOK;
-    }
+		err = 0;
+	}
 
-    AQ_DBG_EXIT(err);
-    return (err);
+	AQ_DBG_EXIT(err);
+	return (err);
 }
 
-int aq_hw_deinit(struct aq_hw *hw)
+int
+aq_hw_deinit(struct aq_hw *hw)
 {
-    AQ_DBG_ENTER();
-    aq_hw_mpi_set(hw, MPI_DEINIT, 0);
-    AQ_DBG_EXIT(0);
-    return (0);
+	AQ_DBG_ENTER();
+	aq_hw_mpi_set(hw, MPI_DEINIT, 0);
+	AQ_DBG_EXIT(0);
+	return (0);
 }
 
-int aq_hw_set_power(struct aq_hw *hw, unsigned int power_state)
+int
+aq_hw_set_power(struct aq_hw *hw, unsigned int power_state)
 {
-    AQ_DBG_ENTER();
-    aq_hw_mpi_set(hw, MPI_POWER, 0);
-    AQ_DBG_EXIT(0);
-    return (0);
+	AQ_DBG_ENTER();
+	aq_hw_mpi_set(hw, MPI_POWER, 0);
+	AQ_DBG_EXIT(0);
+	return (0);
 }
 
 
 /* HW NIC functions */
 
-int aq_hw_reset(struct aq_hw *hw)
+int
+aq_hw_reset(struct aq_hw *hw, bool reboot)
 {
-    int err = 0;
+	int err = 0;
 
-    AQ_DBG_ENTER();
+	AQ_DBG_ENTER();
 
-    err = aq_fw_reset(hw);
-    if (err < 0)
-        goto err_exit;
+	/*
+	 * A2 resets by rebooting the MCP; A1 uses the RBL/FLB reset.  At attach
+	 * aq_hw_mpi_create() has already done this, so the caller passes
+	 * reboot=false to skip the (costly, on A2) redundant MCP reboot.
+	 */
+	if (reboot) {
+		if (IS_CHIP_FEATURE(hw, ATLANTIC2))
+			err = aq2_fw_reboot(hw);
+		else
+			err = aq_fw_reset(hw);
+		if (err != 0)
+			goto err_exit;
+	}
 
-    itr_irq_reg_res_dis_set(hw, 0);
-    itr_res_irq_set(hw, 1);
+	itr_irq_reg_res_dis_set(hw, 0);
+	itr_res_irq_set(hw, 1);
 
-    /* check 10 times by 1ms */
-    AQ_HW_WAIT_FOR(itr_res_irq_get(hw) == 0, 1000, 10);
-    if (err < 0) {
-        printf("atlantic: IRQ reset failed: %d", err);
-        goto err_exit;
-    }
+	/* check 10 times by 1ms */
+	err = AQ_HW_WAIT_FOR(itr_res_irq_get(hw) == 0, 1000, 10);
+	if (err != 0) {
+		device_printf(hw->dev, "IRQ reset failed: %d\n", err);
+		goto err_exit;
+	}
 
-    if (hw->fw_ops && hw->fw_ops->reset)
-        hw->fw_ops->reset(hw);
+	err = hw->fw_ops->reset(hw);
+	if (err != 0)
+		goto err_exit;
 
-    err = aq_hw_err_from_flags(hw);
+	err = aq_hw_err_from_flags(hw);
 
 err_exit:
-    AQ_DBG_EXIT(err);
-    return (err);
+	AQ_DBG_EXIT(err);
+	return (err);
 }
 
-static int aq_hw_qos_set(struct aq_hw *hw)
+static int
+aq_hw_qos_set(struct aq_hw *hw)
 {
-    u32 tc = 0U;
-    u32 buff_size = 0U;
-    unsigned int i_priority = 0U;
-    int err = 0;
+	uint32_t tc = 0U;
+	uint32_t buff_size = 0U;
+	uint32_t n_tcs;
+	unsigned int i_priority = 0U;
+	unsigned int i;
+	int err = 0;
 
-    AQ_DBG_ENTER();
-    /* TPS Descriptor rate init */
-    tps_tx_pkt_shed_desc_rate_curr_time_res_set(hw, 0x0U);
-    tps_tx_pkt_shed_desc_rate_lim_set(hw, 0xA);
+	AQ_DBG_ENTER();
 
-    /* TPS VM init */
-    tps_tx_pkt_shed_desc_vm_arb_mode_set(hw, 0U);
+	/* TPS Descriptor rate init */
+	tps_tx_pkt_shed_desc_rate_curr_time_res_set(hw, 0x0U);
+	tps_tx_pkt_shed_desc_rate_lim_set(hw, 0xA);
 
-    /* TPS TC credits init */
-    tps_tx_pkt_shed_desc_tc_arb_mode_set(hw, 0U);
-    tps_tx_pkt_shed_data_arb_mode_set(hw, 0U);
+	/* TPS VM init */
+	tps_tx_pkt_shed_desc_vm_arb_mode_set(hw, 0U);
 
-    tps_tx_pkt_shed_tc_data_max_credit_set(hw, 0xFFF, 0U);
-    tps_tx_pkt_shed_tc_data_weight_set(hw, 0x64, 0U);
-    tps_tx_pkt_shed_desc_tc_max_credit_set(hw, 0x50, 0U);
-    tps_tx_pkt_shed_desc_tc_weight_set(hw, 0x1E, 0U);
+	/* TPS TC credits init */
+	tps_tx_pkt_shed_desc_tc_arb_mode_set(hw, 0U);
+	tps_tx_pkt_shed_data_arb_mode_set(hw, 0U);
 
-    /* Tx buf size */
-    buff_size = AQ_HW_TXBUF_MAX;
+	/* One TC per active 8-ring group; share the buffer across them. */
+	n_tcs = aq_hw_active_tcs(hw);
+	buff_size = (IS_CHIP_FEATURE(hw, ATLANTIC2) ?
+	    AQ2_HW_TXBUF_MAX : AQ_HW_TXBUF_MAX) / n_tcs;
 
-    tpb_tx_pkt_buff_size_per_tc_set(hw, buff_size, tc);
-    tpb_tx_buff_hi_threshold_per_tc_set(hw,
-                        (buff_size * (1024 / 32U) * 66U) /
-                        100U, tc);
-    tpb_tx_buff_lo_threshold_per_tc_set(hw,
-                        (buff_size * (1024 / 32U) * 50U) /
-                        100U, tc);
+	for (tc = 0; tc < n_tcs; tc++) {
+		if (IS_CHIP_FEATURE(hw, ATLANTIC2)) {
+			/* Atlantic 2's data-TC credit/weight fields are wider. */
+			AQ_WRITE_REG_BIT(hw, TPS_DATA_TCT_REG(tc),
+			    TPS2_DATA_TCT_CREDIT_MAX,
+			    TPS2_DATA_TCT_CREDIT_MAX_SHIFT, 0xfff0);
+			AQ_WRITE_REG_BIT(hw, TPS_DATA_TCT_REG(tc),
+			    TPS2_DATA_TCT_WEIGHT,
+			    TPS2_DATA_TCT_WEIGHT_SHIFT, 0x640);
+		} else {
+			tps_tx_pkt_shed_tc_data_max_credit_set(hw, 0xFFF, tc);
+			tps_tx_pkt_shed_tc_data_weight_set(hw, 0x64, tc);
+		}
+		tps_tx_pkt_shed_desc_tc_max_credit_set(hw, 0x50, tc);
+		tps_tx_pkt_shed_desc_tc_weight_set(hw, 0x1E, tc);
 
-    /* QoS Rx buf size per TC */
-    tc = 0;
-    buff_size = AQ_HW_RXBUF_MAX;
+		tpb_tx_pkt_buff_size_per_tc_set(hw, buff_size, tc);
+		tpb_tx_buff_hi_threshold_per_tc_set(hw,
+		    AQ_BUF_THRESHOLD(buff_size, 66U), tc);
+		tpb_tx_buff_lo_threshold_per_tc_set(hw,
+		    AQ_BUF_THRESHOLD(buff_size, 50U), tc);
+	}
 
-    rpb_rx_pkt_buff_size_per_tc_set(hw, buff_size, tc);
-    rpb_rx_buff_hi_threshold_per_tc_set(hw,
-                        (buff_size *
-                        (1024U / 32U) * 66U) /
-                        100U, tc);
-    rpb_rx_buff_lo_threshold_per_tc_set(hw,
-                        (buff_size *
-                        (1024U / 32U) * 50U) /
-                        100U, tc);
+	/* QoS Rx buf size per TC */
+	tc = 0;
+	buff_size = IS_CHIP_FEATURE(hw, ATLANTIC2) ?
+	    AQ2_HW_RXBUF_MAX : AQ_HW_RXBUF_MAX;
 
-    /* QoS 802.1p priority -> TC mapping */
-    for (i_priority = 8U; i_priority--;)
-        rpf_rpb_user_priority_tc_map_set(hw, i_priority, 0U);
+	rpb_rx_pkt_buff_size_per_tc_set(hw, buff_size, tc);
+	rpb_rx_buff_hi_threshold_per_tc_set(hw,
+	    AQ_BUF_THRESHOLD(buff_size, 66U), tc);
+	rpb_rx_buff_lo_threshold_per_tc_set(hw,
+	    AQ_BUF_THRESHOLD(buff_size, 50U), tc);
 
-    err = aq_hw_err_from_flags(hw);
-    AQ_DBG_EXIT(err);
-    return (err);
+	/* QoS 802.1p priority -> TC mapping */
+	for (i_priority = 8U; i_priority--;)
+		rpf_rpb_user_priority_tc_map_set(hw, i_priority, 0U);
+
+	/* Atlantic 2 ring -> TC map (TC = ring / HW_ATL_B0_RINGS_PER_TC). */
+	if (IS_CHIP_FEATURE(hw, ATLANTIC2)) {
+		AQ_WRITE_REG_BIT(hw, TPB_TX_BUF_REG,
+		    TPB_TX_BUF_TC_Q_RAND_MAP_EN,
+		    TPB_TX_BUF_TC_Q_RAND_MAP_EN_SHIFT, 1);
+		/* TX packs a byte per ring (4/reg); RX a nibble (8/reg). */
+		for (i = 0; i < HW_ATL_B0_RINGS_MAX / 4; i++)
+			AQ_WRITE_REG(hw, AQ2_TX_Q_TC_MAP_REG(i),
+			    (i / 2) * 0x01010101U);
+		for (i = 0; i < HW_ATL_B0_RINGS_MAX / 8; i++)
+			AQ_WRITE_REG(hw, AQ2_RX_Q_TC_MAP_REG(i),
+			    i * 0x11111111U);
+	}
+
+	err = aq_hw_err_from_flags(hw);
+	AQ_DBG_EXIT(err);
+	return (err);
 }
 
-static int aq_hw_offload_set(struct aq_hw *hw)
+/* Tx traffic classes currently provisioned (one per active 8-ring group). */
+static uint32_t
+aq_hw_active_tcs(struct aq_hw *hw)
 {
-    int err = 0;
+	uint32_t n = howmany(MAX(hw->tx_rings_count, 1U),
+	    HW_ATL_B0_RINGS_PER_TC);
 
-    AQ_DBG_ENTER();
-    /* TX checksums offloads*/
-    tpo_ipv4header_crc_offload_en_set(hw, 1);
-    tpo_tcp_udp_crc_offload_en_set(hw, 1);
-    if (err < 0)
-        goto err_exit;
-
-    /* RX checksums offloads*/
-    rpo_ipv4header_crc_offload_en_set(hw, 1);
-    rpo_tcp_udp_crc_offload_en_set(hw, 1);
-    if (err < 0)
-        goto err_exit;
-
-    /* LSO offloads*/
-    tdm_large_send_offload_en_set(hw, 0xFFFFFFFFU);
-    if (err < 0)
-        goto err_exit;
-
-/* LRO offloads */
-    {
-        u32 i = 0;
-        u32 val = (8U < HW_ATL_B0_LRO_RXD_MAX) ? 0x3U :
-            ((4U < HW_ATL_B0_LRO_RXD_MAX) ? 0x2U :
-            ((2U < HW_ATL_B0_LRO_RXD_MAX) ? 0x1U : 0x0));
-
-        for (i = 0; i < HW_ATL_B0_RINGS_MAX; i++)
-            rpo_lro_max_num_of_descriptors_set(hw, val, i);
-
-        rpo_lro_time_base_divider_set(hw, 0x61AU);
-        rpo_lro_inactive_interval_set(hw, 0);
-        /* the LRO timebase divider is 5 uS (0x61a),
-         * to get a maximum coalescing interval of 250 uS,
-         * we need to multiply by 50(0x32) to get
-         * the default value 250 uS
-         */
-        rpo_lro_max_coalescing_interval_set(hw, 50);
-
-        rpo_lro_qsessions_lim_set(hw, 1U);
-
-        rpo_lro_total_desc_lim_set(hw, 2U);
-
-        rpo_lro_patch_optimization_en_set(hw, 0U);
-
-        rpo_lro_min_pay_of_first_pkt_set(hw, 10U);
-
-        rpo_lro_pkt_lim_set(hw, 1U);
-
-        rpo_lro_en_set(hw, (hw->lro_enabled ? 0xFFFFFFFFU : 0U));
-    }
-
-
-    err = aq_hw_err_from_flags(hw);
-
-err_exit:
-    AQ_DBG_EXIT(err);
-    return (err);
+	return (MIN(n, HW_ATL_B0_TCS_MAX));
 }
 
-static int aq_hw_init_tx_path(struct aq_hw *hw)
+static int
+aq_hw_offload_set(struct aq_hw *hw)
 {
-    int err = 0;
+	int err;
 
-    AQ_DBG_ENTER();
+	AQ_DBG_ENTER();
+	/* TX checksums offloads*/
+	tpo_ipv4header_crc_offload_en_set(hw, 1);
+	tpo_tcp_udp_crc_offload_en_set(hw, 1);
 
-    /* Tx TC/RSS number config */
-    tpb_tx_tc_mode_set(hw, 1U);
+	/* RX checksums offloads*/
+	rpo_ipv4header_crc_offload_en_set(hw, 1);
+	rpo_tcp_udp_crc_offload_en_set(hw, 1);
 
-    thm_lso_tcp_flag_of_first_pkt_set(hw, 0x0FF6U);
-    thm_lso_tcp_flag_of_middle_pkt_set(hw, 0x0FF6U);
-    thm_lso_tcp_flag_of_last_pkt_set(hw, 0x0F7FU);
+	/* LSO offloads*/
+	tdm_large_send_offload_en_set(hw, 0xFFFFFFFFU);
 
-    /* Tx interrupts */
-    tdm_tx_desc_wr_wb_irq_en_set(hw, 1U);
+	/* Outer (S-VLAN) tag parse mode */
+	rpo_outer_vlan_tag_mode_set(hw, 1U);
 
-    /* misc */
-    AQ_WRITE_REG(hw, 0x00007040U, 0x00010000U);//IS_CHIP_FEATURE(TPO2) ? 0x00010000U : 0x00000000U);
-    tdm_tx_dca_en_set(hw, 0U);
-    tdm_tx_dca_mode_set(hw, 0U);
+	{
+		uint32_t i = 0;
+		uint32_t val = (8U < HW_ATL_B0_LRO_RXD_MAX) ? 0x3U :
+		    ((4U < HW_ATL_B0_LRO_RXD_MAX) ? 0x2U :
+		    ((2U < HW_ATL_B0_LRO_RXD_MAX) ? 0x1U : 0x0));
 
-    tpb_tx_path_scp_ins_en_set(hw, 1U);
+		for (i = 0; i < HW_ATL_B0_RINGS_MAX; i++)
+			rpo_lro_max_num_of_descriptors_set(hw, val, i);
 
-    err = aq_hw_err_from_flags(hw);
-    AQ_DBG_EXIT(err);
-    return (err);
+		rpo_lro_time_base_divider_set(hw, 0x61AU);
+		rpo_lro_inactive_interval_set(hw, 0);
+		/* the LRO timebase divider is 5 uS (0x61a),
+		 * to get a maximum coalescing interval of 250 uS,
+		 * we need to multiply by 50(0x32) to get
+		 * the default value 250 uS
+		 */
+		rpo_lro_max_coalescing_interval_set(hw, 50);
+
+		rpo_lro_qsessions_lim_set(hw, 1U);
+
+		rpo_lro_total_desc_lim_set(hw, 2U);
+
+		rpo_lro_patch_optimization_en_set(hw, 0U);
+
+		rpo_lro_min_pay_of_first_pkt_set(hw, 10U);
+
+		rpo_lro_pkt_lim_set(hw, 1U);
+
+		rpo_lro_en_set(hw, (hw->lro_enabled ? 0xFFFFFFFFU : 0U));
+	}
+
+
+	err = aq_hw_err_from_flags(hw);
+
+	AQ_DBG_EXIT(err);
+	return (err);
 }
 
-static int aq_hw_init_rx_path(struct aq_hw *hw)
+static int
+aq_hw_init_tx_path(struct aq_hw *hw)
 {
-    //struct aq_nic_cfg_s *cfg = hw->aq_nic_cfg;
-    unsigned int control_reg_val = 0U;
-    int i;
-    int err;
+	int err = 0;
 
-    AQ_DBG_ENTER();
-    /* Rx TC/RSS number config */
-    rpb_rpf_rx_traf_class_mode_set(hw, 1U);
+	AQ_DBG_ENTER();
 
-    /* Rx flow control */
-    rpb_rx_flow_ctl_mode_set(hw, 1U);
+	/* Tx TC/RSS number config */
+	tpb_tx_tc_mode_set(hw, 1U);
 
-    /* RSS Ring selection */
-    reg_rx_flr_rss_control1set(hw, 0xB3333333U);
+	thm_lso_tcp_flag_of_first_pkt_set(hw, 0x0FF6U);
+	thm_lso_tcp_flag_of_middle_pkt_set(hw, 0x0FF6U);
+	thm_lso_tcp_flag_of_last_pkt_set(hw, 0x0F7FU);
 
-    /* Multicast filters */
-    for (i = AQ_HW_MAC_MAX; i--;) {
-        rpfl2_uc_flr_en_set(hw, (i == 0U) ? 1U : 0U, i);
-        rpfl2unicast_flr_act_set(hw, 1U, i);
-    }
+	/* Tx interrupts */
+	tdm_tx_desc_wr_wb_irq_en_set(hw, 1U);
 
-    reg_rx_flr_mcst_flr_msk_set(hw, 0x00000000U);
-    reg_rx_flr_mcst_flr_set(hw, 0x00010FFFU, 0U);
+	/* misc (Atlantic 1 TPO register; absent on Atlantic 2) */
+	if (!IS_CHIP_FEATURE(hw, ATLANTIC2))
+		AQ_WRITE_REG(hw, 0x00007040U,
+		    IS_CHIP_FEATURE(hw, TPO2) ? 0x00010000U : 0x00000000U);
+	tdm_tx_dca_en_set(hw, 0U);
+	tdm_tx_dca_mode_set(hw, 0U);
 
-    /* Vlan filters */
-    rpf_vlan_outer_etht_set(hw, 0x88A8U);
-    rpf_vlan_inner_etht_set(hw, 0x8100U);
+	tpb_tx_path_scp_ins_en_set(hw, 1U);
+
+	err = aq_hw_err_from_flags(hw);
+	AQ_DBG_EXIT(err);
+	return (err);
+}
+
+/* Atlantic 2: install one action-resolver-table row under the ART semaphore. */
+static int
+aq2_art_filter_set(struct aq_hw *hw, uint32_t idx, uint32_t tag,
+    uint32_t mask, uint32_t action)
+{
+	idx += hw->art_filter_base_index;
+	if (idx >= AQ2_ART_TABLE_SIZE) {
+		device_printf(hw->dev,
+		    "ART index %u out of range (firmware base %u)\n", idx,
+		    hw->art_filter_base_index);
+		return (EINVAL);
+	}
+
+	if (AQ_HW_WAIT_FOR(reg_glb_cpu_sem_get(hw, AQ2_ART_SEM_INDEX) == 1U,
+	    10U, 1000U) != 0) {
+		device_printf(hw->dev, "ART semaphore timeout, idx %u\n", idx);
+		return (EBUSY);
+	}
+
+	AQ_WRITE_REG(hw, AQ2_RPF_ACT_ART_REQ_TAG_REG(idx), tag);
+	AQ_WRITE_REG(hw, AQ2_RPF_ACT_ART_REQ_MASK_REG(idx), mask);
+	AQ_WRITE_REG(hw, AQ2_RPF_ACT_ART_REQ_ACTION_REG(idx), action);
+
+	reg_glb_cpu_sem_set(hw, 1U, AQ2_ART_SEM_INDEX);
+	return (0);
+}
+
+static int
+aq_hw_init_rx_path(struct aq_hw *hw)
+{
+	unsigned int control_reg_val = 0U;
+	int i;
+	int err = 0;
+
+	AQ_DBG_ENTER();
+	/* Rx TC/RSS number config */
+	rpb_rpf_rx_traf_class_mode_set(hw, 1U);
+
+	/*
+	 * Atlantic 2: program the RSS hash types the kernel honors.  UDP is
+	 * excluded by default (see aq_rss_hashconfig()); clearing its per-cast
+	 * bits keeps fragmented UDP on a single queue without the A1 L3L4
+	 * flow-filter workaround.
+	 */
+	if (IS_CHIP_FEATURE(hw, ATLANTIC2)) {
+		static const struct {
+			u_int		kern;
+			uint32_t	hw;
+		} ht_map[] = {
+			{ RSS_HASHTYPE_RSS_IPV4,	AQ2_RPF_REDIR2_HASHTYPE_IP },
+			{ RSS_HASHTYPE_RSS_TCP_IPV4,	AQ2_RPF_REDIR2_HASHTYPE_TCP4 },
+			{ RSS_HASHTYPE_RSS_UDP_IPV4,	AQ2_RPF_REDIR2_HASHTYPE_UDP4 },
+			{ RSS_HASHTYPE_RSS_IPV6,	AQ2_RPF_REDIR2_HASHTYPE_IP6 },
+			{ RSS_HASHTYPE_RSS_TCP_IPV6,	AQ2_RPF_REDIR2_HASHTYPE_TCP6 },
+			{ RSS_HASHTYPE_RSS_UDP_IPV6,	AQ2_RPF_REDIR2_HASHTYPE_UDP6 },
+			{ RSS_HASHTYPE_RSS_IPV6_EX,	AQ2_RPF_REDIR2_HASHTYPE_IP6EX },
+			{ RSS_HASHTYPE_RSS_TCP_IPV6_EX,	AQ2_RPF_REDIR2_HASHTYPE_TCP6EX },
+			{ RSS_HASHTYPE_RSS_UDP_IPV6_EX,	AQ2_RPF_REDIR2_HASHTYPE_UDP6EX },
+		};
+		u_int hc = aq_rss_hashconfig();
+		uint32_t ht = 0;
+
+		for (i = 0; i < (int)nitems(ht_map); i++)
+			if (hc & ht_map[i].kern)
+				ht |= ht_map[i].hw;
+		AQ_WRITE_REG_BIT(hw, AQ2_RPF_REDIR2_REG,
+		    AQ2_RPF_REDIR2_HASHTYPE, 0, ht);
+	}
+
+	/* Rx flow control */
+	rpb_rx_flow_ctl_mode_set(hw, 1U);
+
+	/* RSS Ring selection */
+	reg_rx_flr_rss_control1set(hw, 0xB3333333U);
+
+	/* Multicast filters */
+	for (i = AQ_HW_MAC_MAX; i--;) {
+		rpfl2_uc_flr_en_set(hw, (i == 0U) ? 1U : 0U, i);
+		rpfl2unicast_flr_act_set(hw, 1U, i);
+	}
+
+	reg_rx_flr_mcst_flr_msk_set(hw, 0x00000000U);
+	reg_rx_flr_mcst_flr_set(hw, 0x00010FFFU, 0U);
+
+	/* Vlan filters */
+	rpf_vlan_outer_etht_set(hw, 0x88A8U);
+	rpf_vlan_inner_etht_set(hw, 0x8100U);
 	rpf_vlan_accept_untagged_packets_set(hw, true);
 	rpf_vlan_untagged_act_set(hw, HW_ATL_RX_HOST);
 
-    rpf_vlan_prom_mode_en_set(hw, 1);
- 
-    /* Rx Interrupts */
-    rdm_rx_desc_wr_wb_irq_en_set(hw, 1U);
+	rpf_vlan_prom_mode_en_set(hw, 1);
 
-    /* misc */
-    control_reg_val = 0x000F0000U; //RPF2
+	/* Rx Interrupts */
+	rdm_rx_desc_wr_wb_irq_en_set(hw, 1U);
 
-    /* RSS hash type set for IP/TCP */
-    control_reg_val |= 0x1EU;
+	if (IS_CHIP_FEATURE(hw, ATLANTIC2)) {
+		/* Enable the resolver table and tag L2 unicast/broadcast. */
+		AQ_WRITE_REG_BIT(hw, AQ2_RPF_REC_TAB_ENABLE_REG,
+		    AQ2_RPF_REC_TAB_ENABLE_MASK, 0, AQ2_RPF_REC_TAB_ENABLE_MASK);
+		AQ_WRITE_REG_BIT(hw, RPF_L2UC_MSW_REG(0),
+		    RPF_L2UC_MSW_TAG, RPF_L2UC_MSW_TAG_SHIFT, 1);
+		AQ_WRITE_REG_BIT(hw, AQ2_RPF_L2BC_TAG_REG,
+		    AQ2_RPF_L2BC_TAG_MASK, 0, 1);
 
-    AQ_WRITE_REG(hw, 0x00005040U, control_reg_val);
+		/* Drop rows (promisc lifts them); all PCP -> TC 0. */
+		err = aq2_art_filter_set(hw, AQ2_RPF_INDEX_L2_PROMISC_OFF, 0,
+		    AQ2_RPF_TAG_UC_MASK | AQ2_RPF_TAG_ALLMC_MASK,
+		    AQ2_ART_ACTION_DROP);
+		if (err == 0)
+			err = aq2_art_filter_set(hw,
+			    AQ2_RPF_INDEX_VLAN_PROMISC_OFF, 0,
+			    AQ2_RPF_TAG_VLAN_MASK | AQ2_RPF_TAG_UNTAG_MASK,
+			    AQ2_ART_ACTION_DROP);
+		for (i = 0; err == 0 && i < 8; i++)
+			err = aq2_art_filter_set(hw, AQ2_RPF_INDEX_PCP_TO_TC + i,
+			    ((uint32_t)i << AQ2_RPF_TAG_PCP_SHIFT),
+			    AQ2_RPF_TAG_PCP_MASK,
+			    AQ2_ART_ACTION_ASSIGN_TC(0));
+	} else {
+		/* misc */
+		control_reg_val = 0x000F0000U; //RPF2
 
-    rpfl2broadcast_en_set(hw, 1U);
-    rpfl2broadcast_flr_act_set(hw, 1U);
-    rpfl2broadcast_count_threshold_set(hw, 0xFFFFU & (~0U / 256U));
+		/* RSS hash type set for IP/TCP */
+		control_reg_val |= 0x1EU;
 
-    rdm_rx_dca_en_set(hw, 0U);
-    rdm_rx_dca_mode_set(hw, 0U);
+		AQ_WRITE_REG(hw, 0x00005040U, control_reg_val);
+	}
 
-    err = aq_hw_err_from_flags(hw);
-    AQ_DBG_EXIT(err);
-    return (err);
+	rpfl2broadcast_en_set(hw, 1U);
+	rpfl2broadcast_flr_act_set(hw, 1U);
+	rpfl2broadcast_count_threshold_set(hw, 0xFFFFU & (~0U / 256U));
+
+	rdm_rx_dca_en_set(hw, 0U);
+	rdm_rx_dca_mode_set(hw, 0U);
+
+	if (err == 0)
+		err = aq_hw_err_from_flags(hw);
+	AQ_DBG_EXIT(err);
+	return (err);
 }
 
-int aq_hw_mac_addr_set(struct aq_hw *hw, u8 *mac_addr, u8 index)
+int
+aq_hw_mac_addr_set(struct aq_hw *hw, uint8_t *mac_addr, uint8_t index)
 {
-    int err = 0;
-    unsigned int h = 0U;
-    unsigned int l = 0U;
+	int err = 0;
+	unsigned int h = 0U;
+	unsigned int l = 0U;
 
-    AQ_DBG_ENTER();
-    if (!mac_addr) {
-        err = -EINVAL;
-        goto err_exit;
-    }
-    h = (mac_addr[0] << 8) | (mac_addr[1]);
-    l = (mac_addr[2] << 24) | (mac_addr[3] << 16) |
-        (mac_addr[4] << 8) | mac_addr[5];
+	AQ_DBG_ENTER();
+	if (!mac_addr) {
+		err = EINVAL;
+		goto err_exit;
+	}
+	if (index >= AQ_HW_MAC_MAX) {
+		err = EINVAL;
+		goto err_exit;
+	}
+	h = (mac_addr[0] << 8) | (mac_addr[1]);
+	l = (mac_addr[2] << 24) | (mac_addr[3] << 16) | (mac_addr[4] << 8) |
+	    mac_addr[5];
 
-    rpfl2_uc_flr_en_set(hw, 0U, index);
-    rpfl2unicast_dest_addresslsw_set(hw, l, index);
-    rpfl2unicast_dest_addressmsw_set(hw, h, index);
-    rpfl2_uc_flr_en_set(hw, 1U, index);
+	rpfl2_uc_flr_en_set(hw, 0U, index);
+	rpfl2unicast_dest_addresslsw_set(hw, l, index);
+	rpfl2unicast_dest_addressmsw_set(hw, h, index);
+	/* Atlantic 2: classify this address into the resolver table. */
+	if (IS_CHIP_FEATURE(hw, ATLANTIC2))
+		AQ_WRITE_REG_BIT(hw, RPF_L2UC_MSW_REG(index),
+		    RPF_L2UC_MSW_TAG, RPF_L2UC_MSW_TAG_SHIFT, 1);
+	rpfl2_uc_flr_en_set(hw, 1U, index);
 
-    err = aq_hw_err_from_flags(hw);
+	err = aq_hw_err_from_flags(hw);
 
 err_exit:
-    AQ_DBG_EXIT(err);
-    return (err);
+	AQ_DBG_EXIT(err);
+	return (err);
 }
 
-int aq_hw_init(struct aq_hw *hw, u8 *mac_addr, u8 adm_irq, bool msix)
+int
+aq_hw_init(struct aq_hw *hw, uint8_t *mac_addr, uint8_t adm_irq, bool msix)
 {
 
-    int err = 0;
-    u32 val = 0;
+	int err = 0;
+	uint32_t val = 0;
 
-    AQ_DBG_ENTER();
+	AQ_DBG_ENTER();
 
-    /* Force limit MRRS on RDM/TDM to 2K */
-    val = AQ_READ_REG(hw, AQ_HW_PCI_REG_CONTROL_6_ADR);
-    AQ_WRITE_REG(hw, AQ_HW_PCI_REG_CONTROL_6_ADR, (val & ~0x707) | 0x404);
+	/* Atlantic 1 only: clamp MRRS and TX DMA total request limit. */
+	if (!IS_CHIP_FEATURE(hw, ATLANTIC2)) {
+		/* Force limit MRRS on RDM/TDM to 2K */
+		val = AQ_READ_REG(hw, AQ_HW_PCI_REG_CONTROL_6_ADR);
+		AQ_WRITE_REG(hw, AQ_HW_PCI_REG_CONTROL_6_ADR,
+		    (val & ~0x707) | 0x404);
 
-    /* TX DMA total request limit. B0 hardware is not capable to
-    * handle more than (8K-MRRS) incoming DMA data.
-    * Value 24 in 256byte units
-    */
-    AQ_WRITE_REG(hw, AQ_HW_TX_DMA_TOTAL_REQ_LIMIT_ADR, 24);
+		/* TX DMA total request limit. B0 hardware is not capable to
+		* handle more than (8K-MRRS) incoming DMA data.
+		* Value 24 in 256byte units
+		*/
+		AQ_WRITE_REG(hw, AQ_HW_TX_DMA_TOTAL_REQ_LIMIT_ADR, 24);
+	} else {
+		/* Atlantic 2: launch-time clock ratio per FPGA version. */
+		uint32_t fpgaver = AQ_READ_REG(hw, AQ2_HW_FPGA_VERSION_REG);
+		uint32_t ratio;
 
-    aq_hw_init_tx_path(hw);
-    aq_hw_init_rx_path(hw);
+		if (fpgaver < 0x01000000U)
+			ratio = AQ2_LAUNCHTIME_CTRL_RATIO_SPEED_FULL;
+		else if (fpgaver >= 0x01008502U)
+			ratio = AQ2_LAUNCHTIME_CTRL_RATIO_SPEED_HALF;
+		else
+			ratio = AQ2_LAUNCHTIME_CTRL_RATIO_SPEED_QUARTER;
+		AQ_WRITE_REG_BIT(hw, AQ2_LAUNCHTIME_CTRL_REG,
+		    AQ2_LAUNCHTIME_CTRL_RATIO, 8, ratio);
+	}
 
-    aq_hw_mac_addr_set(hw, mac_addr, AQ_HW_MAC);
+	err = aq_hw_init_tx_path(hw);
+	if (err != 0)
+		goto err_exit;
+	err = aq_hw_init_rx_path(hw);
+	if (err != 0)
+		goto err_exit;
 
-    aq_hw_mpi_set(hw, MPI_INIT, hw->link_rate);
+	aq_hw_mac_addr_set(hw, mac_addr, AQ_HW_MAC);
 
-    aq_hw_qos_set(hw);
+	/* A lost ack must not skip the setup that follows. */
+	err = aq_hw_mpi_set(hw, MPI_INIT, hw->link_rate);
+	if (err != 0)
+		device_printf(hw->dev, "could not set F/W link mode: %d\n", err);
 
-    err = aq_hw_err_from_flags(hw);
-    if (err < 0)
-        goto err_exit;
+	aq_hw_qos_set(hw);
 
-    /* Interrupts */
-    //Enable interrupt
-    itr_irq_status_cor_en_set(hw, 0); //Disable clear-on-read for status
-    itr_irq_auto_mask_clr_en_set(hw, 1); // Enable auto-mask clear.
+	/* Atlantic 2: turn on the new RPF / action-resolver engine. */
+	if (IS_CHIP_FEATURE(hw, ATLANTIC2))
+		AQ_WRITE_REG_BIT(hw, AQ2_RPF_NEW_CTRL_REG,
+		    AQ2_RPF_NEW_CTRL_ENABLE, 11, 1);
+
+	err = aq_hw_err_from_flags(hw);
+	if (err != 0)
+		goto err_exit;
+
+	/* Interrupts */
+	//Enable interrupt
+	itr_irq_status_cor_en_set(hw, 0); //Disable clear-on-read for status
+	itr_irq_auto_mask_clr_en_set(hw, 1); // Enable auto-mask clear.
 	if (msix)
 		itr_irq_mode_set(hw, 0x6); //MSIX + multi vector
 	else
 		itr_irq_mode_set(hw, 0x5); //MSI + multi vector
 
-    reg_gen_irq_map_set(hw, 0x80 | adm_irq, 3);
+	/* Route both hardware error causes (map reg 0) to the admin vector. */
+	reg_gen_irq_map_set(hw,
+	    ((0x80U | adm_irq) << 24) | ((0x80U | adm_irq) << 16), 0);
+	reg_gen_irq_map_set(hw, 0x80 | adm_irq, 3);
 
-    aq_hw_offload_set(hw);
+	err = aq_hw_offload_set(hw);
 
 err_exit:
-    AQ_DBG_EXIT(err);
-    return (err);
+	AQ_DBG_EXIT(err);
+	return (err);
 }
 
 
-int aq_hw_start(struct aq_hw *hw)
+int
+aq_hw_start(struct aq_hw *hw)
 {
-    int err;
+	int err;
 
-    AQ_DBG_ENTER();
-    tpb_tx_buff_en_set(hw, 1U);
-    rpb_rx_buff_en_set(hw, 1U);
-    err = aq_hw_err_from_flags(hw);
-    AQ_DBG_EXIT(err);
-    return (err);
+	AQ_DBG_ENTER();
+	tpb_tx_buff_en_set(hw, 1U);
+	rpb_rx_buff_en_set(hw, 1U);
+	err = aq_hw_err_from_flags(hw);
+	AQ_DBG_EXIT(err);
+	return (err);
 }
 
 
-int aq_hw_interrupt_moderation_set(struct aq_hw *hw)
+int
+aq_hw_interrupt_moderation_set(struct aq_hw *hw)
 {
-    static unsigned int AQ_HW_NIC_timers_table_rx_[][2] = {
-        {80, 120},//{0x6U, 0x38U},/* 10Gbit */
-        {0xCU, 0x70U},/* 5Gbit */
-        {0xCU, 0x70U},/* 5Gbit 5GS */
-        {0x18U, 0xE0U},/* 2.5Gbit */
-        {0x30U, 0x80U},/* 1Gbit */
-        {0x4U, 0x50U},/* 100Mbit */
-    };
-    static unsigned int AQ_HW_NIC_timers_table_tx_[][2] = {
-        {0x4fU, 0x1ff},//{0xffU, 0xffU}, /* 10Gbit */
-        {0x4fU, 0xffU}, /* 5Gbit */
-        {0x4fU, 0xffU}, /* 5Gbit 5GS */
-        {0x4fU, 0xffU}, /* 2.5Gbit */
-        {0x4fU, 0xffU}, /* 1Gbit */
-        {0x4fU, 0xffU}, /* 100Mbit */
-    };
-    
-    u32 speed_index = 0U; //itr settings for 10 g 
-    u32 itr_rx = 2U;
-    u32 itr_tx = 2U;
-    int custom_itr = hw->itr;
-    int active = custom_itr != 0;
-    int err;
+	/* Rows in enum aq_fw_link_speed bit order (10M=0 .. 10G=5); index = ffs(speed)-1. */
+	static unsigned int aq_itr_timers_rx[][2] = {
+	    {0x4U, 0x50U},	/* 10Mbit */
+	    {0x4U, 0x50U},	/* 100Mbit */
+	    {0x30U, 0x80U},	/* 1Gbit */
+	    {0x18U, 0xE0U},	/* 2.5Gbit */
+	    {0xCU, 0x70U},	/* 5Gbit */
+	    {80, 120},		/* 10Gbit */
+	};
+	static unsigned int aq_itr_timers_tx[][2] = {
+	    {0x4fU, 0xffU},	/* 10Mbit */
+	    {0x4fU, 0xffU},	/* 100Mbit */
+	    {0x4fU, 0xffU},	/* 1Gbit */
+	    {0x4fU, 0xffU},	/* 2.5Gbit */
+	    {0x4fU, 0xffU},	/* 5Gbit */
+	    {0x4fU, 0x1ff},	/* 10Gbit */
+	};
+
+	uint32_t speed_index = ffs(hw->link_speed ? hw->link_speed : aq_fw_10G) - 1;
+	uint32_t itr_rx = 2U;
+	uint32_t itr_tx = 2U;
+	int custom_itr = hw->itr;
+	int active = custom_itr != 0;
+	int err;
 
 
-    AQ_DBG_ENTER();
-    
-    if (custom_itr == -1) {
-	    itr_rx |= AQ_HW_NIC_timers_table_rx_[speed_index][0] << 0x8U; /* set min timer value */
-	    itr_rx |= AQ_HW_NIC_timers_table_rx_[speed_index][1] << 0x10U; /* set max timer value */
+	AQ_DBG_ENTER();
 
-	    itr_tx |= AQ_HW_NIC_timers_table_tx_[speed_index][0] << 0x8U; /* set min timer value */
-	    itr_tx |= AQ_HW_NIC_timers_table_tx_[speed_index][1] << 0x10U; /* set max timer value */
-    }else{
-	    if (custom_itr > 0x1FF)
-		    custom_itr = 0x1FF;
+	if (custom_itr == -1) {
+		/* set min timer value */
+		itr_rx |= aq_itr_timers_rx[speed_index][0] << 0x8U;
+		/* set max timer value */
+		itr_rx |= aq_itr_timers_rx[speed_index][1] << 0x10U;
 
-	    itr_rx |= (custom_itr/2) << 0x8U; /* set min timer value */
-	    itr_rx |= custom_itr << 0x10U; /* set max timer value */
+		/* set min timer value */
+		itr_tx |= aq_itr_timers_tx[speed_index][0] << 0x8U;
+		/* set max timer value */
+		itr_tx |= aq_itr_timers_tx[speed_index][1] << 0x10U;
+	} else {
+		if (custom_itr > 0x1FF)
+			custom_itr = 0x1FF;
 
-	    itr_tx |= (custom_itr/2) << 0x8U; /* set min timer value */
-	    itr_tx |= custom_itr << 0x10U; /* set max timer value */
-    }
-    
-    tdm_tx_desc_wr_wb_irq_en_set(hw, !active);
-    tdm_tdm_intr_moder_en_set(hw, active);
-    rdm_rx_desc_wr_wb_irq_en_set(hw, !active);
-    rdm_rdm_intr_moder_en_set(hw, active);
-    
-    for (int i = HW_ATL_B0_RINGS_MAX; i--;) {
-        reg_tx_intr_moder_ctrl_set(hw,  itr_tx, i);
-        reg_rx_intr_moder_ctrl_set(hw,  itr_rx, i);
-    }
+		itr_rx |= (custom_itr/2) << 0x8U; /* set min timer value */
+		itr_rx |= custom_itr << 0x10U; /* set max timer value */
 
-    err = aq_hw_err_from_flags(hw);
-    AQ_DBG_EXIT(err);
-    return (err);
+		itr_tx |= (custom_itr/2) << 0x8U; /* set min timer value */
+		itr_tx |= custom_itr << 0x10U; /* set max timer value */
+	}
+
+	tdm_tx_desc_wr_wb_irq_en_set(hw, !active);
+	tdm_tdm_intr_moder_en_set(hw, active);
+	rdm_rx_desc_wr_wb_irq_en_set(hw, !active);
+	rdm_rdm_intr_moder_en_set(hw, active);
+
+	for (int i = HW_ATL_B0_RINGS_MAX; i--;) {
+		/* A2 Tx moderation register moved; same layout.  Rx is shared. */
+		if (IS_CHIP_FEATURE(hw, ATLANTIC2))
+			AQ_WRITE_REG(hw, AQ2_TX_INTR_MODERATION_CTL_REG(i),
+			    itr_tx);
+		else
+			reg_tx_intr_moder_ctrl_set(hw, itr_tx, i);
+		reg_rx_intr_moder_ctrl_set(hw, itr_rx, i);
+	}
+
+	err = aq_hw_err_from_flags(hw);
+	AQ_DBG_EXIT(err);
+	return (err);
 }
 
 /**
@@ -751,62 +978,93 @@ int aq_hw_interrupt_moderation_set(struct aq_hw *hw)
  *  for the particular vlan ids.
  * Note: use this function under vlan promisc mode not to lost the traffic
  *
- * @param aq_hw_s
+ * @param aq_hw
  * @param aq_rx_filter_vlan VLAN filter configuration
  * @return 0 - OK, <0 - error
  */
-int hw_atl_b0_hw_vlan_set(struct aq_hw_s *self,
-				  struct aq_rx_filter_vlan *aq_vlans)
+int
+hw_atl_b0_hw_vlan_set(struct aq_hw *hw, struct aq_rx_filter_vlan *aq_vlans)
 {
 	int i;
 
 	for (i = 0; i < AQ_HW_VLAN_MAX_FILTERS; i++) {
-		hw_atl_rpf_vlan_flr_en_set(self, 0U, i);
-		hw_atl_rpf_vlan_rxq_en_flr_set(self, 0U, i);
+		hw_atl_rpf_vlan_flr_en_set(hw, 0U, i);
+		hw_atl_rpf_vlan_rxq_en_flr_set(hw, 0U, i);
 		if (aq_vlans[i].enable) {
-			hw_atl_rpf_vlan_id_flr_set(self,
+			hw_atl_rpf_vlan_id_flr_set(hw,
 						   aq_vlans[i].vlan_id,
 						   i);
-			hw_atl_rpf_vlan_flr_act_set(self, 1U, i);
-			hw_atl_rpf_vlan_flr_en_set(self, 1U, i);
+			hw_atl_rpf_vlan_flr_act_set(hw, 1U, i);
+			/* A2: tag the filter so the VLAN drop row passes it. */
+			if (IS_CHIP_FEATURE(hw, ATLANTIC2))
+				AQ_WRITE_REG_BIT(hw,
+				    AQ2_RPF_VLAN_FLR_TAG_REG(i),
+				    AQ2_RPF_VLAN_FLR_TAG,
+				    AQ2_RPF_VLAN_FLR_TAG_SHIFT, 1U);
+			hw_atl_rpf_vlan_flr_en_set(hw, 1U, i);
 			if (aq_vlans[i].queue != 0xFF) {
-				hw_atl_rpf_vlan_rxq_flr_set(self,
+				hw_atl_rpf_vlan_rxq_flr_set(hw,
 							    aq_vlans[i].queue,
 							    i);
-				hw_atl_rpf_vlan_rxq_en_flr_set(self, 1U, i);
+				hw_atl_rpf_vlan_rxq_en_flr_set(hw, 1U, i);
 			}
 		}
 	}
 
-	return aq_hw_err_from_flags(self);
+	return aq_hw_err_from_flags(hw);
 }
 
-int hw_atl_b0_hw_vlan_promisc_set(struct aq_hw_s *self, bool promisc)
+int
+hw_atl_b0_hw_vlan_promisc_set(struct aq_hw *hw, bool promisc)
 {
-	hw_atl_rpf_vlan_prom_mode_en_set(self, promisc);
-	return aq_hw_err_from_flags(self);
+	int err;
+
+	/* A2: fallible ART write first; a timeout leaves the legacy bit as-is. */
+	if (IS_CHIP_FEATURE(hw, ATLANTIC2)) {
+		err = aq2_art_filter_set(hw, AQ2_RPF_INDEX_VLAN_PROMISC_OFF,
+		    0, AQ2_RPF_TAG_VLAN_MASK | AQ2_RPF_TAG_UNTAG_MASK,
+		    promisc ? AQ2_ART_ACTION_DISABLE : AQ2_ART_ACTION_DROP);
+		if (err != 0)
+			return (err);
+	}
+	hw_atl_rpf_vlan_prom_mode_en_set(hw, promisc);
+	return aq_hw_err_from_flags(hw);
 }
 
 
-void aq_hw_set_promisc(struct aq_hw_s *self, bool l2_promisc, bool vlan_promisc, bool mc_promisc)
+int
+aq_hw_set_promisc(struct aq_hw *hw, bool l2_promisc, bool vlan_promisc,
+    bool mc_promisc)
 {
-	AQ_DBG_ENTERA("promisc %d, vlan_promisc %d, allmulti %d", l2_promisc, vlan_promisc, mc_promisc);
+	int err = 0;
 
-	rpfl2promiscuous_mode_en_set(self, l2_promisc);
+	AQ_DBG_ENTERA("promisc %d, vlan_promisc %d, allmulti %d", l2_promisc,
+	    vlan_promisc, mc_promisc);
 
-	hw_atl_b0_hw_vlan_promisc_set(self, l2_promisc | vlan_promisc);
+	rpfl2promiscuous_mode_en_set(hw, l2_promisc);
 
-	rpfl2_accept_all_mc_packets_set(self, mc_promisc);
-	rpfl2multicast_flr_en_set(self, mc_promisc, 0);
+	err = hw_atl_b0_hw_vlan_promisc_set(hw, l2_promisc | vlan_promisc);
 
-	AQ_DBG_EXIT(0);
+	/* A2: promisc toggles the unicast drop row. */
+	if (err == 0 && IS_CHIP_FEATURE(hw, ATLANTIC2))
+		err = aq2_art_filter_set(hw, AQ2_RPF_INDEX_L2_PROMISC_OFF, 0,
+		    AQ2_RPF_TAG_UC_MASK | AQ2_RPF_TAG_ALLMC_MASK,
+		    l2_promisc ? AQ2_ART_ACTION_DISABLE : AQ2_ART_ACTION_DROP);
+
+	rpfl2_accept_all_mc_packets_set(hw, mc_promisc);
+	rpfl2multicast_flr_en_set(hw, mc_promisc, 0);
+
+	AQ_DBG_EXIT(err);
+	return (err);
 }
 
-int aq_hw_rss_hash_set(struct aq_hw_s *self, u8 rss_key[HW_ATL_RSS_HASHKEY_SIZE])
+int
+aq_hw_rss_hash_set(struct aq_hw *hw,
+    uint8_t rss_key[HW_ATL_RSS_HASHKEY_SIZE])
 {
-	u32 rss_key_dw[HW_ATL_RSS_HASHKEY_SIZE / 4];
-	u32 addr = 0U;
-	u32 i = 0U;
+	uint32_t rss_key_dw[HW_ATL_RSS_HASHKEY_SIZE / 4];
+	uint32_t addr = 0U;
+	uint32_t i = 0U;
 	int err = 0;
 
 	AQ_DBG_ENTER();
@@ -814,94 +1072,127 @@ int aq_hw_rss_hash_set(struct aq_hw_s *self, u8 rss_key[HW_ATL_RSS_HASHKEY_SIZE]
 	memcpy(rss_key_dw, rss_key, HW_ATL_RSS_HASHKEY_SIZE);
 
 	for (i = 10, addr = 0U; i--; ++addr) {
-		u32 key_data = bswap32(rss_key_dw[i]);
-		rpf_rss_key_wr_data_set(self, key_data);
-		rpf_rss_key_addr_set(self, addr);
-		rpf_rss_key_wr_en_set(self, 1U);
-		AQ_HW_WAIT_FOR(rpf_rss_key_wr_en_get(self) == 0,
+		uint32_t key_data = bswap32(rss_key_dw[i]);
+		rpf_rss_key_wr_data_set(hw, key_data);
+		rpf_rss_key_addr_set(hw, addr);
+		rpf_rss_key_wr_en_set(hw, 1U);
+		err = AQ_HW_WAIT_FOR(rpf_rss_key_wr_en_get(hw) == 0,
 			       1000U, 10U);
-		if (err < 0)
+		if (err != 0)
 			goto err_exit;
 	}
 
-	err = aq_hw_err_from_flags(self);
+	err = aq_hw_err_from_flags(hw);
 
 err_exit:
 	AQ_DBG_EXIT(err);
 	return (err);
 }
 
-int aq_hw_rss_hash_get(struct aq_hw_s *self, u8 rss_key[HW_ATL_RSS_HASHKEY_SIZE])
+int
+aq_hw_rss_hash_get(struct aq_hw *hw,
+    uint8_t rss_key[HW_ATL_RSS_HASHKEY_SIZE])
 {
-	u32 rss_key_dw[HW_ATL_RSS_HASHKEY_SIZE / 4];
-	u32 addr = 0U;
-	u32 i = 0U;
+	uint32_t rss_key_dw[HW_ATL_RSS_HASHKEY_SIZE / 4];
+	uint32_t addr = 0U;
+	uint32_t i = 0U;
 	int err = 0;
 
 	AQ_DBG_ENTER();
 
 	for (i = 10, addr = 0U; i--; ++addr) {
-		rpf_rss_key_addr_set(self, addr);
-		rss_key_dw[i] = bswap32(rpf_rss_key_rd_data_get(self));
+		rpf_rss_key_addr_set(hw, addr);
+		rss_key_dw[i] = bswap32(rpf_rss_key_rd_data_get(hw));
 	}
 	memcpy(rss_key, rss_key_dw, HW_ATL_RSS_HASHKEY_SIZE);
 
-	err = aq_hw_err_from_flags(self);
+	err = aq_hw_err_from_flags(hw);
 
 	AQ_DBG_EXIT(err);
 	return (err);
 }
 
-int aq_hw_rss_set(struct aq_hw_s *self, u8 rss_table[HW_ATL_RSS_INDIRECTION_TABLE_MAX])
+int
+aq_hw_rss_set(struct aq_hw *hw,
+    uint8_t rss_table[HW_ATL_RSS_INDIRECTION_TABLE_MAX])
 {
-	u16 bitary[(HW_ATL_RSS_INDIRECTION_TABLE_MAX *
+	uint16_t bitary[(HW_ATL_RSS_INDIRECTION_TABLE_MAX *
 					3 / 16U)];
 	int err = 0;
-	u32 i = 0U;
+	uint32_t i = 0U;
 
 	memset(bitary, 0, sizeof(bitary));
 
-	for (i = HW_ATL_RSS_INDIRECTION_TABLE_MAX; i--;) {
-		(*(u32 *)(bitary + ((i * 3U) / 16U))) |=
-			((rss_table[i]) << ((i * 3U) & 0xFU));
+	/* A2 per-TC redirection table; flat RX rings, same queue per TC. */
+	if (IS_CHIP_FEATURE(hw, ATLANTIC2)) {
+		uint32_t n_tcs = aq_hw_active_tcs(hw);
+		int tc, slot, q;
+		uint32_t word;
+
+		AQ_WRITE_REG_BIT(hw, AQ2_RPF_REDIR2_REG, AQ2_RPF_REDIR2_INDEX,
+		    12, 0);
+		for (slot = 0; slot < AQ2_RPF_RSS_REDIR_MAX; slot++) {
+			q = rss_table[slot] &
+			    (HW_ATL_RSS_INDIRECTION_QUEUES_MAX - 1U);
+			word = 0U;
+			for (tc = 0; (uint32_t)tc < n_tcs; tc++)
+				word |= (uint32_t)q << (5 * tc);
+			AQ_WRITE_REG(hw, AQ2_RPF_RSS_REDIR_REG(0, slot), word);
+		}
+		/* A2 uses this table only; skip the legacy indirection writes. */
+		return (aq_hw_err_from_flags(hw));
 	}
 
-	for (i = ARRAY_SIZE(bitary); i--;) {
-		rpf_rss_redir_tbl_wr_data_set(self, bitary[i]);
-		rpf_rss_redir_tbl_addr_set(self, i);
-		rpf_rss_redir_wr_en_set(self, 1U);
-		AQ_HW_WAIT_FOR(rpf_rss_redir_wr_en_get(self) == 0,
+	for (i = HW_ATL_RSS_INDIRECTION_TABLE_MAX; i--;) {
+		uint32_t bit_pos = i * HW_ATL_RSS_INDIRECTION_ENTRY_BITS;
+		uint32_t word = bit_pos / 16U;
+		uint32_t shift = bit_pos % 16U;
+		uint32_t field = (uint32_t)(rss_table[i] &
+		    (HW_ATL_RSS_INDIRECTION_QUEUES_MAX - 1U)) << shift;
+
+		bitary[word] |= (uint16_t)field;
+		if (shift + HW_ATL_RSS_INDIRECTION_ENTRY_BITS > 16U &&
+		    word + 1U < nitems(bitary))
+			bitary[word + 1U] |= (uint16_t)(field >> 16);
+	}
+
+	for (i = nitems(bitary); i--;) {
+		rpf_rss_redir_tbl_wr_data_set(hw, bitary[i]);
+		rpf_rss_redir_tbl_addr_set(hw, i);
+		rpf_rss_redir_wr_en_set(hw, 1U);
+		err = AQ_HW_WAIT_FOR(rpf_rss_redir_wr_en_get(hw) == 0,
 			       1000U, 10U);
-		if (err < 0)
+		if (err != 0)
 			goto err_exit;
 	}
 
-	err = aq_hw_err_from_flags(self);
+	err = aq_hw_err_from_flags(hw);
 
 err_exit:
 	return (err);
 }
 
-int aq_hw_udp_rss_enable(struct aq_hw_s *self, bool enable)
+int
+aq_hw_udp_rss_enable(struct aq_hw *hw, bool enable)
 {
 	int err = 0;
-	if(!enable) {
+	if (!enable) {
 		/* HW bug workaround:
 		 * Disable RSS for UDP using rx flow filter 0.
 		 * HW does not track RSS stream for fragmenged UDP,
 		 * 0x5040 control reg does not work.
 		 */
-		hw_atl_rpf_l3_l4_enf_set(self, true, 0);
-		hw_atl_rpf_l4_protf_en_set(self, true, 0);
-		hw_atl_rpf_l3_l4_rxqf_en_set(self, true, 0);
-		hw_atl_rpf_l3_l4_actf_set(self, L2_FILTER_ACTION_HOST, 0);
-		hw_atl_rpf_l3_l4_rxqf_set(self, 0, 0);
-		hw_atl_rpf_l4_protf_set(self, HW_ATL_RX_UDP, 0);
+		hw_atl_rpf_l3_l4_enf_set(hw, true, 0);
+		hw_atl_rpf_l4_protf_en_set(hw, true, 0);
+		hw_atl_rpf_l3_l4_rxqf_en_set(hw, true, 0);
+		hw_atl_rpf_l3_l4_actf_set(hw, L2_FILTER_ACTION_HOST, 0);
+		hw_atl_rpf_l3_l4_rxqf_set(hw, 0, 0);
+		hw_atl_rpf_l4_protf_set(hw, HW_ATL_RX_UDP, 0);
 	} else {
-		hw_atl_rpf_l3_l4_enf_set(self, false, 0);
+		hw_atl_rpf_l3_l4_enf_set(hw, false, 0);
 	}
 
-	err = aq_hw_err_from_flags(self);
+	err = aq_hw_err_from_flags(hw);
 	return (err);
 
 }

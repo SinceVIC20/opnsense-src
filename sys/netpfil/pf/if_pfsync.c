@@ -982,7 +982,7 @@ pfsync_input(struct mbuf **mp, int *offp __unused, int proto __unused)
 	}
 
 	if (offset + sizeof(*ph) > m->m_len) {
-		if (m_pullup(m, offset + sizeof(*ph)) == NULL) {
+		if ((m = m_pullup(m, offset + sizeof(*ph))) == NULL) {
 			V_pfsyncstats.pfsyncs_hdrops++;
 			return (IPPROTO_DONE);
 		}
@@ -1085,7 +1085,7 @@ pfsync6_input(struct mbuf **mp, int *offp __unused, int proto __unused)
 	}
 
 	if (offset + sizeof(*ph) > m->m_len) {
-		if (m_pullup(m, offset + sizeof(*ph)) == NULL) {
+		if ((m = m_pullup(m, offset + sizeof(*ph))) == NULL) {
 			V_pfsyncstats.pfsyncs_hdrops++;
 			return (IPPROTO_DONE);
 		}

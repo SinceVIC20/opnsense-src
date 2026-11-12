@@ -35,53 +35,20 @@
 #ifndef _AQ_COMMON_H_
 #define _AQ_COMMON_H_
 
-#include <stdint.h>
+#include <sys/types.h>
 
-#define ETH_MAC_LEN 6
-
-/* Types definition */
-#define TRUE     1
-#define FALSE    0
-
-#define s8       __int8_t
-#define u8       __uint8_t
-#define u16      __uint16_t
-#define s16      __int16_t
-#define u32      __uint32_t
-#define u64      __uint64_t
-#define s64      __int64_t
-#define s32      int
-typedef __uint32_t DWORD;
-
-#define ETIME ETIMEDOUT
-#define EOK 0
 
 #define BIT(nr) (1UL << (nr))
 
-#define usec_delay(x) DELAY(x)
+#define AQ_HW_WAIT_FOR(_B_, _US_, _N_) ({ \
+	unsigned int _i; \
+	int _b; \
+	for (_i = (_N_); !(_b = (_B_)) && _i; --_i) \
+		DELAY(_US_); \
+	_b ? 0 : ETIMEDOUT; \
+})
 
-#ifndef msec_delay
-#define msec_delay(x) DELAY(x*1000)
-#define msec_delay_irq(x) DELAY(x*1000)
-#endif
-
-#define AQ_HW_WAIT_FOR(_B_, _US_, _N_) \
-    do { \
-        unsigned int i; \
-        for (i = _N_; (!(_B_)) && i; --i) { \
-            usec_delay(_US_); \
-        } \
-        if (!i) { \
-            err = -1; \
-        } \
-    } while (0)
-
-
-#define LODWORD(a) ((DWORD)(a))
-#define LOWORD(a) ((u16)(a))
-#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
 #define AQ_VER        "0.0.5"
 
-#endif //_AQ_COMMON_H_
-
+#endif // _AQ_COMMON_H_

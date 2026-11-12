@@ -45,34 +45,33 @@ __FBSDID("$FreeBSD$");
 #include "aq_dbg.h"
 
 
-const aq_debug_level dbg_level_ = lvl_detail;
-const u32 dbg_categories_ = dbg_init | dbg_config | dbg_fw;
-
-
-
 #define DESCR_FIELD(DESCR, BIT_BEGIN, BIT_END) \
 	((DESCR >> BIT_END) &\
 		(BIT(BIT_BEGIN - BIT_END + 1) -1))
 
 #define __field(TYPE, VAR) TYPE VAR;
-void trace_aq_tx_descr(int ring_idx, unsigned int pointer, volatile u64 descr[2])
+
+#if AQ_CFG_DEBUG_LVL > 2
+void
+trace_aq_tx_descr(struct aq_hw *hw, int ring_idx, unsigned int pointer,
+    volatile uint64_t descr[2])
 {
 #if AQ_CFG_DEBUG_LVL > 2
 	struct __entry{
 		__field(unsigned int, ring_idx)
 		__field(unsigned int, pointer)
 		/* Tx Descriptor */
-		__field(u64, data_buf_addr)
-		__field(u32, pay_len)
-		__field(u8, ct_en)
-		__field(u8, ct_idx)
-		__field(u16, rsvd2)
-		__field(u8, tx_cmd)
-		__field(u8, eop)
-		__field(u8, dd)
-		__field(u16, buf_len)
-		__field(u8, rsvd1)
-		__field(u8, des_typ)
+		__field(uint64_t, data_buf_addr)
+		__field(uint32_t, pay_len)
+		__field(uint8_t, ct_en)
+		__field(uint8_t, ct_idx)
+		__field(uint16_t, rsvd2)
+		__field(uint8_t, tx_cmd)
+		__field(uint8_t, eop)
+		__field(uint8_t, dd)
+		__field(uint16_t, buf_len)
+		__field(uint8_t, rsvd1)
+		__field(uint8_t, des_typ)
 	} entry;
 
 	entry.ring_idx = ring_idx;
@@ -90,7 +89,7 @@ void trace_aq_tx_descr(int ring_idx, unsigned int pointer, volatile u64 descr[2]
 	entry.des_typ = DESCR_FIELD(descr[1], 2, 0);
 
 
-	aq_log_detail("trace_aq_tx_descr ring=%d descr=%u pay_len=%u ct_en=%u ct_idx=%u rsvd2=0x%x tx_cmd=0x%x eop=%u dd=%u buf_len=%u rsvd1=%u des_typ=0x%x",
+	aq_log_detail(hw, "trace_aq_tx_descr ring=%d descr=%u pay_len=%u ct_en=%u ct_idx=%u rsvd2=0x%x tx_cmd=0x%x eop=%u dd=%u buf_len=%u rsvd1=%u des_typ=0x%x",
 		  entry.ring_idx, entry.pointer, entry.pay_len,
 		  entry.ct_en, entry.ct_idx, entry.rsvd2,
 		  entry.tx_cmd, entry.eop, entry.dd, entry.buf_len,
@@ -98,27 +97,29 @@ void trace_aq_tx_descr(int ring_idx, unsigned int pointer, volatile u64 descr[2]
 #endif
 }
 
-void trace_aq_rx_descr(int ring_idx, unsigned int pointer, volatile u64 descr[2])
+void
+trace_aq_rx_descr(struct aq_hw *hw, int ring_idx, unsigned int pointer,
+    volatile uint64_t descr[2])
 {
 #if AQ_CFG_DEBUG_LVL > 2
-	u8 dd;
-	u8 eop;
-	u8 rx_stat;
-	u8 rx_estat;
-	u8 rsc_cnt;
-	u16 pkt_len;
-	u16 next_desp;
-	u16 vlan_tag;
+	uint8_t dd;
+	uint8_t eop;
+	uint8_t rx_stat;
+	uint8_t rx_estat;
+	uint8_t rsc_cnt;
+	uint16_t pkt_len;
+	uint16_t next_desp;
+	uint16_t vlan_tag;
 
-	u8 rss_type;
-	u8 pkt_type;
-	u8 rdm_err;
-	u8 avb_ts;
-	u8 rsvd;
-	u8 rx_cntl;
-	u8 sph;
-	u16 hdr_len;
-	u32 rss_hash;
+	uint8_t rss_type;
+	uint8_t pkt_type;
+	uint8_t rdm_err;
+	uint8_t avb_ts;
+	uint8_t rsvd;
+	uint8_t rx_cntl;
+	uint8_t sph;
+	uint16_t hdr_len;
+	uint32_t rss_hash;
 
 	rss_hash = DESCR_FIELD(descr[0], 63, 32);
 	hdr_len =  DESCR_FIELD(descr[0], 31, 22);
@@ -139,7 +140,7 @@ void trace_aq_rx_descr(int ring_idx, unsigned int pointer, volatile u64 descr[2]
 	eop = DESCR_FIELD(descr[1], 1, 1);
 	dd = DESCR_FIELD(descr[1], 0, 0);
 
-	printf("trace_aq_rx_descr ring=%d descr=%u rss_hash=0x%x hdr_len=%u sph=%u rx_cntl=%u rsvd=0x%x avb_ts=%u rdm_err=%u pkt_type=%u rss_type=%u vlan_tag=%u next_desp=%u pkt_len=%u rsc_cnt=%u rx_estat=0x%x rx_stat=0x%x eop=%u dd=%u\n",
+	aq_log_detail(hw, "trace_aq_rx_descr ring=%d descr=%u rss_hash=0x%x hdr_len=%u sph=%u rx_cntl=%u rsvd=0x%x avb_ts=%u rdm_err=%u pkt_type=%u rss_type=%u vlan_tag=%u next_desp=%u pkt_len=%u rsc_cnt=%u rx_estat=0x%x rx_stat=0x%x eop=%u dd=%u",
 		  ring_idx, pointer, rss_hash,
 		  hdr_len, sph, rx_cntl,
 		  rsvd, avb_ts, rdm_err,
@@ -149,24 +150,26 @@ void trace_aq_rx_descr(int ring_idx, unsigned int pointer, volatile u64 descr[2]
 #endif
 }
 
-void trace_aq_tx_context_descr(int ring_idx, unsigned int pointer, volatile u64 descr[2])
+void
+trace_aq_tx_context_descr(struct aq_hw *hw, int ring_idx, unsigned int pointer,
+    volatile uint64_t descr[2])
 {
 #if AQ_CFG_DEBUG_LVL > 2
 	struct __entry_s{
 		__field(unsigned int, ring_idx)
 		__field(unsigned int, pointer)
 		/* Tx Context Descriptor */
-		__field(u16, out_len)
-		__field(u8, tun_len)
-		__field(u64, resvd3)
-		__field(u16, mss_len)
-		__field(u8, l4_len)
-		__field(u8, l3_len)
-		__field(u8, l2_len)
-		__field(u8, ct_cmd)
-		__field(u16, vlan_tag)
-		__field(u8, ct_idx)
-		__field(u8, des_typ)
+		__field(uint16_t, out_len)
+		__field(uint8_t, tun_len)
+		__field(uint64_t, resvd3)
+		__field(uint16_t, mss_len)
+		__field(uint8_t, l4_len)
+		__field(uint8_t, l3_len)
+		__field(uint8_t, l2_len)
+		__field(uint8_t, ct_cmd)
+		__field(uint16_t, vlan_tag)
+		__field(uint8_t, ct_idx)
+		__field(uint8_t, des_typ)
 	} entry;
 	struct __entry_s *__entry = &entry;
 	__entry->ring_idx = ring_idx;
@@ -183,7 +186,7 @@ void trace_aq_tx_context_descr(int ring_idx, unsigned int pointer, volatile u64 
 	__entry->ct_idx = DESCR_FIELD(descr[1], 3, 3);
 	__entry->des_typ = DESCR_FIELD(descr[1], 2, 0);
 
-	printf("trace_aq_tx_context_descr ring=%d descr=%u out_len=%u tun_len=%u resvd3=%lu mss_len=%u l4_len=%u l3_len=%u l2_len=%d ct_cmd=%u vlan_tag=%u ct_idx=%u des_typ=0x%x\n",
+	aq_log_detail(hw, "trace_aq_tx_context_descr ring=%d descr=%u out_len=%u tun_len=%u resvd3=%lu mss_len=%u l4_len=%u l3_len=%u l2_len=%d ct_cmd=%u vlan_tag=%u ct_idx=%u des_typ=0x%x",
 		  __entry->ring_idx, __entry->pointer, __entry->out_len,
 		  __entry->tun_len, __entry->resvd3, __entry->mss_len,
 		  __entry->l4_len, __entry->l3_len, __entry->l2_len,
@@ -191,47 +194,4 @@ void trace_aq_tx_context_descr(int ring_idx, unsigned int pointer, volatile u64 
 		  __entry->des_typ);
 #endif
 }
-
-void DumpHex(const void* data, size_t size) {
-#if AQ_CFG_DEBUG_LVL > 3
-	char ascii[17];
-	size_t i, j;
-	char line[256];
-	char buf[256];
-
-	ascii[16] = '\0';
-	line[0] = '\0';
-	printf("packet at %p\n", data);
-
-	for (i = 0; i < size; ++i) {
-		sprintf(buf, "%02X ", ((const unsigned char*)data)[i]);
-		strcat(line, buf);
-		if (((const unsigned char*)data)[i] >= ' ' && ((const unsigned char*)data)[i] <= '~') {
-			ascii[i % 16] = ((const unsigned char*)data)[i];
-		} else {
-			ascii[i % 16] = '.';
-		}
-		if ((i+1) % 8 == 0 || i+1 == size) {
-			strcat(line, " ");
-			if ((i+1) % 16 == 0) {
-				sprintf(buf, "|  %s \n", ascii);
-				strcat(line, buf);
-				printf("%s", line);
-				line[0] = '\0';
-			} else if (i+1 == size) {
-				ascii[(i+1) % 16] = '\0';
-				if ((i+1) % 16 <= 8) {
-					strcat(line, " ");
-				}
-				for (j = (i+1) % 16; j < 16; ++j) {
-					strcat(line, "   ");
-				}
-				sprintf(buf, "|  %s \n", ascii);
-				strcat(line, buf);
-				printf("%s", line);
-				line[0] = '\0';
-			}
-		}
-	}
 #endif
-}
