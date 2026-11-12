@@ -349,9 +349,10 @@ qman_rx_tcp_csum(struct mbuf *m, int l4off, int tlen, void *l3, bool v6)
 	if (v6)
 		return (in6_cksum_pseudo(l3, tlen, IPPROTO_TCP, sum) == 0xffff);
 #endif
+	/* sum is in memory byte order, like the addresses: add it as is. */
 	ip = l3;
 	return (in_pseudo(ip->ip_src.s_addr, ip->ip_dst.s_addr,
-	    htonl(sum + tlen + IPPROTO_TCP)) == 0xffff);
+	    htonl(tlen + IPPROTO_TCP) + sum) == 0xffff);
 }
 
 /*
